@@ -1,0 +1,12 @@
+RPC_URL = https://solana-mainnet.g.alchemy.com/v2/
+DATABASE_URL=postgresql+asyncpg
+BOT_TOKEN=
+ADDRESS_WALLET=
+PRIVATE_WALLET_KEY=
+
+DB_HOST=host.docker.internal
+DB_PORT=5432
+DB_NAME=
+DB_USER=
+DB_PASSWORD=
+DATABASE_DOCKER_URL=postgresql://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}

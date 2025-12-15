@@ -1,0 +1,19 @@
+services:
+  app:
+    build: .
+    image: myapp:gpu
+    # >>> GPU в Compose (официальный способ)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all           # или 1 / 2
+              capabilities: [gpu]
+    # >>> Передаем env
+    env_file:
+      - .env                      # чтобы DATABASE_URL попал внутрь
+    environment:
+      # опционально продублировать критичное
+      - DATABASE_URL=${DATABASE_URL}
+    command: python -m core.main_docker

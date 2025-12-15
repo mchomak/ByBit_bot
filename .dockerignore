@@ -1,0 +1,30 @@
+# VCS и IDE
+.git
+.gitignore
+.vscode/
+.idea/
+
+# Python артефакты
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyo
+*.egg-info/
+.dist/
+build/
+dist/
+
+# Виртуальные окружения
+.venv/
+venv/
+
+# Логи, временные и большие данные (подстрой под себя)
+logs/
+tmp/
+data/
+*.env
+bt_test_47_fold1/
+tools/
+
+# Если попутно есть Node/TS
+node_modules/
