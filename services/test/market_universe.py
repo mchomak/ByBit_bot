@@ -17,7 +17,7 @@ from typing import Dict, List, Optional, Set
 import httpx
 from loguru import logger
 
-from ..config.settings import Settings
+from ...config.config import Settings
 from ..db.repository import Repository
 from ..db.models import Token
 

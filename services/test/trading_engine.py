@@ -23,7 +23,7 @@ import httpx
 import websockets
 from loguru import logger
 
-from ..config.settings import Settings
+from ...config.config import Settings
 from ..db.repository import Repository
 from ..db.models import Order, Position, OrderSide, OrderStatus, PositionStatus
 from ..queues.event_bus import (

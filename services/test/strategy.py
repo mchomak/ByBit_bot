@@ -21,7 +21,7 @@ from typing import Any, Dict, List, Optional, Set
 import numpy as np
 from loguru import logger
 
-from ..config.settings import Settings
+from ...config.config import Settings
 from ..db.repository import Repository
 from ..db.models import Candle1m, Position, Signal, PositionStatus, SignalType
 from ..queues.event_bus import (

@@ -18,15 +18,15 @@ from typing import Any, Dict, Optional
 
 from loguru import logger
 
-from .config.settings import settings
+from ..config.config import settings
 from .db.database import Database
 from .db.repository import Repository
 from .queues.event_bus import EventBus
-from .services.market_universe import MarketUniverseService
-from .services.market_data import BybitMarketDataService
-from .services.strategy import StrategyService
-from .services.trading_engine import TradingEngine
-from .services.telegram_service import TelegramService
+from .test.market_universe import MarketUniverseService
+from .test.market_data import BybitMarketDataService
+from .test.strategy import StrategyService
+from .test.trading_engine import TradingEngine
+from .test.telegram_service import TelegramService
 
 
 class TradingBot:

@@ -21,7 +21,7 @@ import httpx
 import websockets
 from loguru import logger
 
-from ..config.settings import Settings
+from ...config.config import Settings
 from ..db.repository import Repository
 from ..db.models import Candle1m
 from ..queues.event_bus import MarketDataQueue

@@ -25,7 +25,7 @@ from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command
 from loguru import logger
 
-from ..config.settings import Settings
+from ...config.config import Settings
 from ..db.repository import Repository
 from ..db.models import User, Position, PositionStatus
 from ..queues.event_bus import NotificationQueue, NotificationEvent

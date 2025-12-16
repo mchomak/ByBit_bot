@@ -12,10 +12,13 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import sessionmaker
+import sys
+import os
 
-from .models import Base
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from db.models import Base
 
-T = TypeVar("T", bound=Base)
+T = TypeVar("T", bound= Base)
 
 
 class Repository:

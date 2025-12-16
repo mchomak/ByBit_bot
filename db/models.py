@@ -1,137 +1,278 @@
-"""Database structure definitions using SQLAlchemy ORM."""
+"""Database models for Bybit Trading Bot.
 
-from sqlalchemy import Column, String, Float, DateTime, Integer, Boolean, ForeignKey, UniqueConstraint
+Tables:
+- tokens: List of tradeable coins/pairs with market cap and status
+- candles_1m: 1-minute OHLCV candle history (5-day rolling window)
+- positions: Active and closed trading positions
+- orders: Order history
+- users: Telegram users with their settings
+- logs: System and error logs
+- signals: Strategy signal log for analysis
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from enum import Enum
+from typing import Optional
+
+from sqlalchemy import (
+    Column,
+    String,
+    Float,
+    DateTime,
+    Integer,
+    Boolean,
+    BigInteger,
+    Text,
+    Index,
+    UniqueConstraint,
+    Enum as SQLEnum,
+)
 from sqlalchemy.orm import declarative_base
-from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.sql import func
-
-created_at = Column(DateTime(timezone=True), server_default=func.now())
-updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
 Base = declarative_base()
 
-# List of tokens that the bot can trade.
+
+# =============================================================================
+# Enums
+# =============================================================================
+
+
+class PositionStatus(str, Enum):
+    """Position status enum."""
+
+    OPEN = "open"
+    CLOSED = "closed"
+
+
+class OrderSide(str, Enum):
+    """Order side enum."""
+
+    BUY = "buy"
+    SELL = "sell"
+
+
+class OrderStatus(str, Enum):
+    """Order status enum."""
+
+    PENDING = "pending"
+    FILLED = "filled"
+    PARTIALLY_FILLED = "partially_filled"
+    CANCELLED = "cancelled"
+    REJECTED = "rejected"
+
+
+class SignalType(str, Enum):
+    """Signal type enum."""
+
+    ENTRY = "entry"  # Volume spike + price acceleration
+    EXIT = "exit"  # MA14 crossover
+
+
+class LogLevel(str, Enum):
+    """Log level enum."""
+
+    DEBUG = "debug"
+    INFO = "info"
+    WARNING = "warning"
+    ERROR = "error"
+    CRITICAL = "critical"
+
+
+# =============================================================================
+# Models
+# =============================================================================
+
+
 class Token(Base):
+    """
+    List of coins/pairs that the bot monitors.
+
+    Populated by MarketUniverseService from CoinMarketCap + Bybit API.
+    Filtered by market_cap > MIN_MARKET_CAP_USD.
+    """
+
     __tablename__ = "tokens"
-    token_address = Column(String, primary_key=True, unique=True)
-    pool_address = Column(String, unique=True)
-    token_name = Column(String)
-    liqd = Column(Float)
-    age_days = Column(Integer)
-    holders_count = Column(Integer)
-    gt_score = Column(Float)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    symbol = Column(String(20), nullable=False, unique=True, index=True)  # e.g., "BTC"
+    bybit_symbol = Column(String(30), nullable=False, unique=True)  # e.g., "BTCUSDT"
+    name = Column(String(100), nullable=True)  # e.g., "Bitcoin"
+    market_cap_usd = Column(BigInteger, nullable=True)
+    is_active = Column(Boolean, default=True)  # Whether to trade this token
+    last_updated = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (Index("ix_tokens_active", "is_active"),)
 
 
-# List of tokens that are blacklisted from trading (at the filtering level).
-class BlacklistedToken(Base):
-    __tablename__ = "blacklisted_tokens"
-    pool_address = Column(String, primary_key=True)
-    reason = Column(String, nullable=True)  # можно указывать причину блокировки (опционально)
-    added_at = Column(DateTime(timezone=True), server_default=func.now())
+class Candle1m(Base):
+    """
+    1-minute OHLCV candles for all monitored symbols.
 
+    Updated every second via WebSocket (upsert current candle).
+    At minute boundary, new candle is created.
+    Old candles (> 5 days) are cleaned up periodically.
+    """
 
-# List of tokens that the bot currently holds (bought but not sold).
-class Hold(Base):
-    __tablename__ = "holds"
-    id = Column(Integer, primary_key=True)
-    token_address = Column(String, ForeignKey("tokens.token_address"))
-    pool_address  = Column(String, ForeignKey("tokens.pool_address"), unique=True)
-    prob = Column(Float)
-    buy_time = Column(DateTime(timezone=True))
-    buy_price = Column(Float)
-    now_price = Column(Float)
-    percent_diff = Column(Float)
-    amount = Column(Float)
+    __tablename__ = "candles_1m"
 
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    symbol = Column(String(30), nullable=False, index=True)  # e.g., "BTCUSDT"
+    timestamp = Column(
+        DateTime(timezone=True), nullable=False
+    )  # Start of the minute (truncated)
+    open = Column(Float, nullable=False)
+    high = Column(Float, nullable=False)
+    low = Column(Float, nullable=False)
+    close = Column(Float, nullable=False)
+    volume = Column(Float, nullable=False)  # Base asset volume
+    turnover = Column(Float, nullable=True)  # Quote asset volume (USDT)
+    is_confirmed = Column(Boolean, default=False)  # True when candle is finalized
 
-# Logs of model predictions.
-class PredictLog(Base):
-    __tablename__ = "predict_logs"
-    id = Column(Integer, primary_key=True)
-    token_address = Column(String)
-    pool_address = Column(String)
-    time = Column(DateTime(timezone=True))
-    prob = Column(Float)
-    threshold = Column(Float)
-
-
-# Logs of all transactions (buys and sells).
-class TransactionLog(Base):
-    __tablename__ = "transaction_logs"
-    id = Column(Integer, primary_key=True)
-    trade_type = Column(String)  # buy/sell
-    timestamp = Column(DateTime(timezone=True))
-    token_address = Column(String)
-    pool_address = Column(String)
-    buy_hesh = Column(String, unique=True)
-    sell_hesh = Column(String, unique=True)
-    buy_time = Column(DateTime(timezone=True))
-    buy_price = Column(Float)
-    sell_time = Column(DateTime(timezone=True))
-    sell_price = Column(Float)
-    profit = Column(Float)
-    prob = Column(Float)
-    threshold = Column(Float)
-    buy_amount = Column(Float)
-    sell_amount = Column(Float)
-
-
-# Table with historical token prices.
-class Prices(Base):
-    __tablename__ = "prices"
-    id = Column(Integer, primary_key=True)
-    token_address = Column(String, ForeignKey("tokens.token_address"))
-    pool_address = Column(String, ForeignKey("tokens.pool_address"))
-    price = Column(Float)
-    timestamp = Column(DateTime(timezone=True))
-
-
-# Table with OHLCV data (custom).
-class OHLCV(Base):
-    __tablename__ = "ohlcv"
-    id = Column(Integer, primary_key=True)
-    token_address = Column(String, ForeignKey("tokens.token_address"))
-    pool_address = Column(String, ForeignKey("tokens.pool_address"))
-    timestamp = Column(DateTime(timezone=True))
-    open = Column(Float)
-    high = Column(Float)
-    low = Column(Float)
-    close = Column(Float)
-    volume = Column(Float)
     __table_args__ = (
-        UniqueConstraint('token_address', 'timestamp', name='uix_ohlcv_token_time'),
+        UniqueConstraint("symbol", "timestamp", name="uix_candles_symbol_ts"),
+        Index("ix_candles_symbol_ts", "symbol", "timestamp"),
     )
 
 
-# Table with OHLCV data from an external API (GeckoTerminal).
-class OHLCV_API(Base):
-    __tablename__ = "ohlcv_api"
-    id = Column(Integer, primary_key=True)
-    token_address = Column(String)
-    pool_address = Column(String)
-    timestamp = Column(DateTime(timezone=True))
-    open = Column(Float)
-    high = Column(Float)
-    low = Column(Float)
-    close = Column(Float)
-    volume = Column(Float)
-    __table_args__ = (
-        UniqueConstraint('token_address', 'timestamp', name='uix_ohlcv_token_time_2'),
+class Position(Base):
+    """
+    Trading positions (active and historical).
+
+    Created on BUY signal, updated on SELL.
+    """
+
+    __tablename__ = "positions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    symbol = Column(String(30), nullable=False, index=True)
+    status = Column(
+        SQLEnum(PositionStatus), default=PositionStatus.OPEN, nullable=False
     )
 
+    # Entry info
+    entry_price = Column(Float, nullable=False)
+    entry_amount = Column(Float, nullable=False)  # Quantity of base asset
+    entry_value_usdt = Column(Float, nullable=False)  # USDT value at entry
+    entry_time = Column(DateTime(timezone=True), nullable=False)
+    entry_order_id = Column(String(100), nullable=True)
 
-class ParsedTokens(Base):
-    __tablename__ = "parsed_tokens"
-    id           = Column(Integer, primary_key=True)
-    token_address = Column(String)
-    pool_address = Column(String,  unique=True, index=True, nullable=False)
-    token_name   = Column(String)
-    liqd         = Column(Float) 
-    age_days    = Column(Integer) 
-    volume_24h   = Column(Float)
-    holders_count = Column(Integer)
-    gt_score     = Column(Float)
+    # Exit info (filled when closed)
+    exit_price = Column(Float, nullable=True)
+    exit_amount = Column(Float, nullable=True)
+    exit_value_usdt = Column(Float, nullable=True)
+    exit_time = Column(DateTime(timezone=True), nullable=True)
+    exit_order_id = Column(String(100), nullable=True)
+    exit_reason = Column(String(50), nullable=True)  # e.g., "ma14_crossover"
 
-    __table_args__ = (
-        UniqueConstraint("pool_address", name="uq_parsed_tokens_pool_address"),
-    )
+    # P&L
+    profit_usdt = Column(Float, nullable=True)
+    profit_pct = Column(Float, nullable=True)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (Index("ix_positions_status", "status"),)
+
+
+class Order(Base):
+    """
+    Order log for all buy/sell orders.
+
+    Tracks order lifecycle from creation to fill/cancel.
+    """
+
+    __tablename__ = "orders"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    bybit_order_id = Column(String(100), nullable=True, unique=True)
+    symbol = Column(String(30), nullable=False, index=True)
+    side = Column(SQLEnum(OrderSide), nullable=False)
+    status = Column(SQLEnum(OrderStatus), default=OrderStatus.PENDING, nullable=False)
+
+    # Order details
+    price = Column(Float, nullable=True)  # None for market orders
+    quantity = Column(Float, nullable=False)
+    filled_quantity = Column(Float, default=0.0)
+    avg_fill_price = Column(Float, nullable=True)
+
+    # Timestamps
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    # Link to position
+    position_id = Column(Integer, nullable=True)
+
+    __table_args__ = (Index("ix_orders_symbol_status", "symbol", "status"),)
+
+
+class User(Base):
+    """
+    Telegram users who interact with the bot.
+
+    Stores user-specific settings like position limits.
+    """
+
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    telegram_id = Column(BigInteger, nullable=False, unique=True, index=True)
+    username = Column(String(100), nullable=True)
+    is_admin = Column(Boolean, default=False)
+
+    # User settings
+    limit_positions = Column(Integer, default=5)  # Max simultaneous positions
+    notifications_enabled = Column(Boolean, default=True)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    last_active = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class Signal(Base):
+    """
+    Strategy signal log for analysis and debugging.
+
+    Records every entry/exit signal generated by the strategy.
+    """
+
+    __tablename__ = "signals"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    symbol = Column(String(30), nullable=False, index=True)
+    signal_type = Column(SQLEnum(SignalType), nullable=False)
+    timestamp = Column(DateTime(timezone=True), nullable=False)
+
+    # Signal metrics
+    price = Column(Float, nullable=False)
+    volume = Column(Float, nullable=True)
+    volume_ratio = Column(Float, nullable=True)  # Current vol / max historical vol
+    price_change_pct = Column(Float, nullable=True)  # (close - open) / open * 100
+    ma14_value = Column(Float, nullable=True)
+
+    # Was the signal acted upon?
+    executed = Column(Boolean, default=False)
+    execution_reason = Column(String(200), nullable=True)  # Why not executed, if any
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (Index("ix_signals_symbol_ts", "symbol", "timestamp"),)
+
+
+class Log(Base):
+    """
+    System and error logs stored in database.
+
+    For critical errors, API failures, reconnects, etc.
+    """
+
+    __tablename__ = "logs"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    level = Column(SQLEnum(LogLevel), nullable=False, index=True)
+    component = Column(String(50), nullable=False)  # e.g., "TradingEngine", "WebSocket"
+    message = Column(Text, nullable=False)
+    details = Column(Text, nullable=True)  # JSON or stack trace
+    timestamp = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+    __table_args__ = (Index("ix_logs_level_ts", "level", "timestamp"),)

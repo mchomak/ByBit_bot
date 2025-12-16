@@ -13,15 +13,15 @@ from db.db_reader import DatabaseReader
 from db.db_writer import DatabaseWriter
 from config.config import *
 from db.models import *
-from api.get_price_tracker import PriceFetcher
+from services.get_price_tracker import PriceFetcher
 from db.db_ohlcv_creator import OHLCVService
-from api.gecko_ohlcv_new import OHLCVFFREEAPI
+from services.gecko_ohlcv_new import OHLCVFFREEAPI
 from ml.preprocessor import Preprocessor
 from core.business_logic import decide_token
 from core.create_daily_report import daily_report
 from ml.lstm_predictor import LSTMPredictor
 from tx_tools.raydium_trader import RaydiumTrader
-from api.sol_price_client import SolanaTokenPriceClient
+from services.sol_price_client import SolanaTokenPriceClient
 from core.main_config import config
 
 from datetime import datetime, timezone
