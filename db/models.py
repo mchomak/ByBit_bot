@@ -101,6 +101,7 @@ class Token(Base):
     bybit_symbol = Column(String(30), nullable=False, unique=True)  # e.g., "BTCUSDT"
     name = Column(String(100), nullable=True)  # e.g., "Bitcoin"
     market_cap_usd = Column(BigInteger, nullable=True)
+    bybit_categories = Column(String(50), nullable=True)  # Comma-separated: "spot,linear"
     is_active = Column(Boolean, default=True)  # Whether to trade this token
     last_updated = Column(DateTime(timezone=True), server_default=func.now())
 

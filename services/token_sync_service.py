@@ -192,7 +192,7 @@ async def example_usage():
     )
     
     # Подключение к БД
-    DATABASE_URL = "postgresql+asyncpg://user:password@localhost:5432/trading_bot"
+    DATABASE_URL = "postgresql+asyncpg://postgres:rWg3_0XFt1@localhost/ByBit_bot"
     engine = create_async_engine(DATABASE_URL, echo=False)
     
     async with engine.begin() as conn:

@@ -9,7 +9,6 @@ from typing import List
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
 
-from bybit_client_new import BybitClient  # replace import if you renamed the file
 import sys
 import os
 
@@ -17,16 +16,38 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from config.config import settings
 from db.models import Candle1m, Token
 from db.repository import Repository
+from services.bybit_client import BybitClient
 
 
 log = logging.getLogger("candles_ingest")
 
 
-async def _load_symbols(repo: Repository, limit: int | None = None) -> List[str]:
-    # tokens table has bybit_symbol (e.g., BTCUSDT)
+async def _load_symbols(repo: Repository, limit: int | None = None, category: str | None = None) -> List[str]:
+    """
+    Load symbols from DB, optionally filtered by Bybit category.
+
+    Args:
+        repo: Repository instance
+        limit: Max number of symbols to return
+        category: Filter by Bybit category (spot, linear, etc.)
+                 Only returns symbols that have this category in bybit_categories
+    """
     filters = {"is_active": True}
     tokens = await repo.get_all(Token, filters=filters, limit=limit)
-    return [t.bybit_symbol for t in tokens if t.bybit_symbol]
+
+    result = []
+    for t in tokens:
+        if not t.bybit_symbol:
+            continue
+        # If category filter is specified, check if token is available in that category
+        if category and t.bybit_categories:
+            # bybit_categories is comma-separated, e.g. "linear,spot"
+            available_cats = [c.strip().lower() for c in t.bybit_categories.split(",")]
+            if category.strip().lower() not in available_cats:
+                continue
+        result.append(t.bybit_symbol)
+
+    return result
 
 
 async def _cleanup_old_candles(repo: Repository, days: int = 5) -> None:
@@ -38,7 +59,7 @@ async def main() -> None:
     logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
     database_url = settings.database_url
-    bybit_category = os.getenv("BYBIT_CATEGORY", "linear").strip().lower()  # spot|linear|inverse|option
+    bybit_category = os.getenv("BYBIT_CATEGORY", "spot").strip().lower()  # spot|linear|inverse|option
     ws_domain = os.getenv("BYBIT_WS_DOMAIN", "stream.bybit.com").strip()
 
     # SQLAlchemy async setup
@@ -46,11 +67,18 @@ async def main() -> None:
     session_factory = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     repo = Repository(session_factory)
 
-    symbols = await _load_symbols(repo, limit=int(os.getenv("MAX_SYMBOLS", "0")) or None)
+    symbols = await _load_symbols(
+        repo,
+        limit=int(os.getenv("MAX_SYMBOLS", "0")) or None,
+        category=bybit_category,
+    )
     if not symbols:
-        raise RuntimeError("No active symbols found in tokens table. Populate tokens first.")
+        raise RuntimeError(
+            f"No active symbols found in tokens table for category '{bybit_category}'. "
+            "Populate tokens first or check BYBIT_CATEGORY setting."
+        )
 
-    log.info("Symbols loaded: %d", len(symbols))
+    log.info("Symbols loaded for category '%s': %d", bybit_category, len(symbols))
 
     async with BybitClient(ws_domain=ws_domain) as bybit:
         # 1) Bootstrap last 5 days of 1m history (REST)

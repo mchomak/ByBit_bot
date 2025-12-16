@@ -16,7 +16,7 @@ import sys
 import os
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from paprika_bybit_matcher import sync_tokens_to_database
+from services.paprika_bybit_matcher import sync_tokens_to_database
 from db.repository import Repository
 from db.models import Base, Token
 
