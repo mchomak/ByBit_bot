@@ -82,7 +82,7 @@ class _CandleUpsertBuffer:
             rows = list(self._buf.values())
             self._buf.clear()
 
-        async with self._session_factory() as session:  # type: AsyncSession
+        async with self._session_factory() as session:
             stmt = pg_insert(self._model).values(rows)
             update_cols = {
                 "open": stmt.excluded.open,
@@ -419,7 +419,7 @@ class BybitClient:
                 if not rows:
                     return
 
-                async with session_factory() as session:  # type: AsyncSession
+                async with session_factory() as session:
                     stmt = pg_insert(candle_model).values(rows)
                     update_cols = {
                         "open": stmt.excluded.open,

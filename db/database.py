@@ -8,8 +8,12 @@ from typing import Optional
 from loguru import logger
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, AsyncEngine
 from sqlalchemy.orm import sessionmaker
+import sys
+import os
 
-from .models import Base
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from config.config import settings
+from db.models import Base
 
 
 class Database:
@@ -104,3 +108,7 @@ class Database:
         except Exception as e:
             self.log.error(f"Database health check failed: {e}")
             return False
+
+
+db = Database(database_url=settings.database_url)
+asyncio.run(db.create_tables())

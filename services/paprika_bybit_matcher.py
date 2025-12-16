@@ -5,10 +5,14 @@ import logging
 import random
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set
-
 import aiohttp
+import sys
+import os
 
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from bybit_client import BybitClient
+from db.repository import Repository
+from db.models import Token
 
 
 @dataclass(frozen=True)
@@ -139,6 +143,123 @@ def _apply_symbol_aliases(symbol: str, aliases: Dict[str, str]) -> str:
     return aliases.get(symbol, symbol)
 
 
+async def sync_tokens_to_database(
+    repository: Repository,
+    market_cap_threshold_usd: float,
+    bybit_categories: List[str],
+    symbol_aliases: Optional[Dict[str, str]] = None,
+    logger: Optional[logging.Logger] = None,
+) -> int:
+    """
+    Синхронизирует токены в БД:
+    1) Получает данные из CoinPaprika (/v1/tickers)
+    2) Фильтрует по порогу market cap
+    3) Получает инструменты Bybit и строит universe baseCoin для категорий
+    4) Делает пересечение по symbol==baseCoin
+    5) Сохраняет токены в БД через очередь (upsert по symbol)
+    6) Деактивирует токены, которых больше нет в списке
+    
+    Args:
+        repository: Repository instance для работы с БД
+        market_cap_threshold_usd: Минимальный market cap в USD
+        bybit_categories: Список категорий Bybit для фильтрации
+        symbol_aliases: Словарь алиасов для нормализации символов
+        logger: Logger instance
+        
+    Returns:
+        Количество синхронизированных токенов
+    """
+    log = logger or logging.getLogger("TokenSync")
+    aliases = symbol_aliases or {}
+
+    # Запускаем write worker если еще не запущен
+    await repository.start_write_worker()
+
+    async with CoinPaprikaClient(logger=log) as paprika, BybitClient(logger=log) as bybit:
+        log.info("Fetching CoinPaprika tickers...")
+        tickers = await paprika.get_tickers()
+
+        candidates = [
+            t for t in tickers
+            if t.market_cap_usd >= market_cap_threshold_usd
+        ]
+        log.info("CoinPaprika candidates with mcap>=%.0f: %d", market_cap_threshold_usd, len(candidates))
+
+        log.info("Fetching Bybit instruments baseCoin universe for categories: %s", bybit_categories)
+        base_map = await bybit.get_base_coin_map(categories=bybit_categories)
+
+        synced_symbols: Set[str] = set()
+        tokens_to_sync = []
+
+        for t in candidates:
+            normalized_symbol = _apply_symbol_aliases(t.symbol, aliases)
+            bybit_cats: Set[str] = base_map.get(normalized_symbol, set())
+            
+            if not bybit_cats:
+                continue
+
+            # Формируем bybit_symbol (для spot обычно SYMBOL+USDT)
+            # Если в категориях есть "linear" - это фьючерсы, иначе spot
+            bybit_symbol = f"{normalized_symbol}USDT"
+            
+            tokens_to_sync.append({
+                "symbol": normalized_symbol,
+                "bybit_symbol": bybit_symbol,
+                "name": t.name,
+                "market_cap_usd": int(t.market_cap_usd),
+                "is_active": True,
+            })
+            
+            synced_symbols.add(normalized_symbol)
+
+        # Сортируем по market cap (от большего к меньшему)
+        tokens_to_sync.sort(key=lambda x: x["market_cap_usd"], reverse=True)
+
+        # Отправляем токены в очередь на запись (upsert)
+        log.info(f"Enqueueing {len(tokens_to_sync)} tokens for upsert...")
+        for token_data in tokens_to_sync:
+            await repository.enqueue_upsert(
+                model=Token,
+                conflict_keys={"symbol": token_data["symbol"]},
+                update_values={
+                    "bybit_symbol": token_data["bybit_symbol"],
+                    "name": token_data["name"],
+                    "market_cap_usd": token_data["market_cap_usd"],
+                    "is_active": True,
+                }
+            )
+
+        # Получаем все активные токены из БД
+        log.info("Fetching active tokens from database...")
+        active_tokens = await repository.get_all(
+            model=Token,
+            filters={"is_active": True}
+        )
+
+        # Деактивируем токены, которых больше нет в списке
+        tokens_to_deactivate = 0
+        for token in active_tokens:
+            if token.symbol not in synced_symbols:
+                await repository.enqueue_update(
+                    model=Token,
+                    filter_by={"symbol": token.symbol},
+                    update_values={"is_active": False}
+                )
+                tokens_to_deactivate += 1
+
+        if tokens_to_deactivate > 0:
+            log.info(f"Deactivating {tokens_to_deactivate} tokens that are no longer tradable")
+
+        # Ждем завершения всех операций в очереди
+        log.info("Waiting for write queue to complete...")
+        await repository._write_queue.join()
+
+        log.info(f"Token sync completed: {len(tokens_to_sync)} tokens synced, "
+                f"{tokens_to_deactivate} deactivated")
+        
+        return len(tokens_to_sync)
+
+
 async def collect_tokens_tradable_on_bybit_with_mcap(
     market_cap_threshold_usd: float,
     bybit_categories: List[str],
@@ -146,6 +267,10 @@ async def collect_tokens_tradable_on_bybit_with_mcap(
     logger: Optional[logging.Logger] = None,
 ) -> List[Dict[str, Any]]:
     """
+    DEPRECATED: Используйте sync_tokens_to_database для записи в БД.
+    
+    Эта функция оставлена для обратной совместимости и возвращает данные в формате CSV.
+    
     1) Pull tickers from CoinPaprika (/v1/tickers)
     2) Filter by market cap threshold
     3) Pull Bybit instruments and build baseCoin universe for categories

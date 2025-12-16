@@ -13,9 +13,6 @@ from zoneinfo import ZoneInfo
 from paprika_bybit_matcher import collect_tokens_tradable_on_bybit_with_mcap
 
 
-TZ = ZoneInfo(os.getenv("TZ_NAME", "Europe/Istanbul"))
-
-
 @dataclass(frozen=True)
 class AppConfig:
     market_cap_threshold_usd: float
@@ -81,25 +78,6 @@ def write_csv(rows: List[Dict[str, Any]], output_path: Path) -> None:
         for r in rows:
             writer.writerow(r)
 
-
-async def run_job(cfg: AppConfig, log: logging.Logger) -> Path:
-    rows = await collect_tokens_tradable_on_bybit_with_mcap(
-        market_cap_threshold_usd=cfg.market_cap_threshold_usd,
-        bybit_categories=cfg.bybit_categories,
-        symbol_aliases=cfg.symbol_aliases,
-        logger=log,
-    )
-
-    local_date = datetime.now(TZ).strftime("%Y-%m-%d")
-    threshold_int = int(cfg.market_cap_threshold_usd)
-
-    out_file = cfg.output_dir / f"bybit_tokens_mcap_ge_{threshold_int}_{local_date}.csv"
-    write_csv(rows, out_file)
-
-    log.info("Saved %d rows -> %s", len(rows), str(out_file))
-    return out_file
-
-
 async def main() -> None:
     logging.basicConfig(
         level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -111,10 +89,20 @@ async def main() -> None:
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
 
     log.info("Config: threshold=%.0f, categories=%s, tz=%s, output_dir=%s",
-             cfg.market_cap_threshold_usd, cfg.bybit_categories, TZ.key, cfg.output_dir)
+             cfg.market_cap_threshold_usd, cfg.bybit_categories, cfg.output_dir)
 
 
-    run_job(cfg, log)
+    rows = await collect_tokens_tradable_on_bybit_with_mcap(
+        market_cap_threshold_usd=cfg.market_cap_threshold_usd,
+        bybit_categories=cfg.bybit_categories,
+        symbol_aliases=cfg.symbol_aliases,
+        logger=log,
+    )
+    threshold_int = int(cfg.market_cap_threshold_usd)
+    out_file = cfg.output_dir / f"bybit_tokens_mcap_ge_{threshold_int}_.csv"
+    write_csv(rows, out_file)
+    log.info("Saved %d rows -> %s", len(rows), str(out_file))
+
 
 
 if __name__ == "__main__":

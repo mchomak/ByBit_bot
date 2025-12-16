@@ -10,27 +10,16 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
 
 from bybit_client_new import BybitClient  # replace import if you renamed the file
+import sys
+import os
 
-# Flexible imports depending on your project layout
-try:
-    from db.models import Candle1m, Token  # type: ignore
-except Exception:  # noqa: BLE001
-    from models import Candle1m, Token  # type: ignore
-
-try:
-    from db.repository import Repository  # type: ignore
-except Exception:  # noqa: BLE001
-    from repository import Repository  # type: ignore
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from config.config import settings
+from db.models import Candle1m, Token
+from db.repository import Repository
 
 
 log = logging.getLogger("candles_ingest")
-
-
-def _get_env(name: str, default: str | None = None) -> str:
-    val = os.getenv(name, default)
-    if val is None or not str(val).strip():
-        raise RuntimeError(f"Missing required env var: {name}")
-    return str(val).strip()
 
 
 async def _load_symbols(repo: Repository, limit: int | None = None) -> List[str]:
@@ -48,7 +37,7 @@ async def _cleanup_old_candles(repo: Repository, days: int = 5) -> None:
 async def main() -> None:
     logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
-    database_url = _get_env("DATABASE_URL")
+    database_url = settings.database_url
     bybit_category = os.getenv("BYBIT_CATEGORY", "linear").strip().lower()  # spot|linear|inverse|option
     ws_domain = os.getenv("BYBIT_WS_DOMAIN", "stream.bybit.com").strip()
 
