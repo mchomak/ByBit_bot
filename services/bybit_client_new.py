@@ -29,6 +29,15 @@ class BybitAPIError(RuntimeError):
     """Raised when Bybit returns non-zero retCode or malformed response."""
 
 
+@dataclass
+class CandleBufferMetrics:
+    """Metrics for candle buffer operations."""
+    messages_received: int = 0
+    rows_upserted: int = 0
+    flush_count: int = 0
+    errors: int = 0
+
+
 class _CandleUpsertBuffer:
     """
     Batches candle UPSERTs to PostgreSQL.
@@ -59,6 +68,7 @@ class _CandleUpsertBuffer:
         self._buf: Dict[Tuple[str, datetime], Dict[str, Any]] = {}
         self._stop = asyncio.Event()
         self._task: Optional[asyncio.Task] = None
+        self.metrics = CandleBufferMetrics()
 
     async def start(self) -> None:
         if self._task is None:
@@ -74,6 +84,7 @@ class _CandleUpsertBuffer:
         key = (row["symbol"], row["timestamp"])
         async with self._lock:
             self._buf[key] = row
+            self.metrics.messages_received += 1
 
     async def flush_now(self) -> int:
         async with self._lock:
@@ -82,23 +93,29 @@ class _CandleUpsertBuffer:
             rows = list(self._buf.values())
             self._buf.clear()
 
-        async with self._session_factory() as session:
-            stmt = pg_insert(self._model).values(rows)
-            update_cols = {
-                "open": stmt.excluded.open,
-                "high": stmt.excluded.high,
-                "low": stmt.excluded.low,
-                "close": stmt.excluded.close,
-                "volume": stmt.excluded.volume,
-                "turnover": stmt.excluded.turnover,
-                "is_confirmed": stmt.excluded.is_confirmed,
-            }
-            stmt = stmt.on_conflict_do_update(
-                index_elements=["symbol", "timestamp"],
-                set_=update_cols,
-            )
-            await session.execute(stmt)
-            await session.commit()
+        try:
+            async with self._session_factory() as session:
+                stmt = pg_insert(self._model).values(rows)
+                update_cols = {
+                    "open": stmt.excluded.open,
+                    "high": stmt.excluded.high,
+                    "low": stmt.excluded.low,
+                    "close": stmt.excluded.close,
+                    "volume": stmt.excluded.volume,
+                    "turnover": stmt.excluded.turnover,
+                    "is_confirmed": stmt.excluded.is_confirmed,
+                }
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=["symbol", "timestamp"],
+                    set_=update_cols,
+                )
+                await session.execute(stmt)
+                await session.commit()
+            self.metrics.rows_upserted += len(rows)
+            self.metrics.flush_count += 1
+        except Exception:
+            self.metrics.errors += 1
+            raise
 
         return len(rows)
 
@@ -518,7 +535,8 @@ class BybitClient:
         candle_model: Any,
         flush_interval_s: float = 1.0,
         reconnect_backoff_s: float = 2.0,
-    ) -> None:
+        duration_s: Optional[float] = None,
+    ) -> CandleBufferMetrics:
         """
         Subscribe to kline.1 for symbols and write updates to PostgreSQL.
 
@@ -527,10 +545,22 @@ class BybitClient:
           - Sends ping every ~20s (recommended by Bybit)
           - Batch UPSERTs to candles_1m every flush_interval_s seconds
           - Auto-reconnects each connection independently
+
+        Args:
+            category: Bybit market category (spot, linear, inverse, option)
+            symbols: List of symbols to subscribe to
+            session_factory: SQLAlchemy async session factory
+            candle_model: SQLAlchemy model for candles table
+            flush_interval_s: How often to flush buffer to DB
+            reconnect_backoff_s: Base backoff time for reconnection
+            duration_s: Optional duration in seconds; if set, stops after this time
+
+        Returns:
+            CandleBufferMetrics with counts of messages received and rows upserted
         """
         if not symbols:
             self._log.warning("No symbols provided for WS stream; exiting")
-            return
+            return CandleBufferMetrics()
 
         topics = [f"kline.1.{s}" for s in symbols]
         topic_groups = self._split_topics_for_connection(topics)
@@ -543,6 +573,16 @@ class BybitClient:
         )
         await buffer.start()
 
+        # If duration is set, schedule a stop event
+        stop_event = asyncio.Event()
+        duration_task: Optional[asyncio.Task] = None
+        if duration_s is not None and duration_s > 0:
+            async def _stop_after_duration():
+                await asyncio.sleep(duration_s)
+                self._log.info("Duration limit reached (%.1fs), stopping stream...", duration_s)
+                stop_event.set()
+            duration_task = asyncio.create_task(_stop_after_duration(), name="duration-limit")
+
         async def _run_one_connection(group_topics: List[str]) -> None:
             attempt = 0
 
@@ -550,7 +590,7 @@ class BybitClient:
             # For linear/inverse there is no explicit args-per-request cap "for now", but we still chunk.
             per_request = 10 if category.strip().lower() == "spot" else 200
 
-            while True:
+            while not stop_event.is_set():
                 ws: Optional[ClientWebSocketResponse] = None
                 ping_task: Optional[asyncio.Task] = None
                 try:
@@ -570,6 +610,10 @@ class BybitClient:
                     attempt = 0
 
                     async for msg in ws:
+                        # Check if we should stop
+                        if stop_event.is_set():
+                            break
+
                         if msg.type == aiohttp.WSMsgType.TEXT:
                             try:
                                 payload = json.loads(msg.data)
@@ -611,6 +655,8 @@ class BybitClient:
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:  # noqa: BLE001
+                    if stop_event.is_set():
+                        break
                     attempt += 1
                     sleep_s = min(60.0, reconnect_backoff_s * (2 ** min(attempt, 6)))
                     self._log.warning("WS error: %s. Reconnect in %.1fs", e, sleep_s)
@@ -627,12 +673,33 @@ class BybitClient:
         tasks = [asyncio.create_task(_run_one_connection(g)) for g in topic_groups]
 
         try:
-            await asyncio.gather(*tasks)
-        finally:
-            for t in tasks:
-                t.cancel()
-            with contextlib.suppress(Exception):
+            # Wait for either all tasks to complete or stop_event to be set
+            if duration_task:
+                done, pending = await asyncio.wait(
+                    tasks + [duration_task],
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                # If duration task completed, cancel others
+                if duration_task in done:
+                    for t in tasks:
+                        t.cancel()
+            else:
                 await asyncio.gather(*tasks)
+        finally:
+            # Cancel duration task if still running
+            if duration_task and not duration_task.done():
+                duration_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await duration_task
+            # Cancel all connection tasks
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            with contextlib.suppress(Exception):
+                await asyncio.gather(*tasks, return_exceptions=True)
+            # Final flush
             with contextlib.suppress(Exception):
                 await buffer.flush_now()
             await buffer.stop()
+
+        return buffer.metrics
