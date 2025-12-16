@@ -194,22 +194,26 @@ async def sync_tokens_to_database(
         for t in candidates:
             normalized_symbol = _apply_symbol_aliases(t.symbol, aliases)
             bybit_cats: Set[str] = base_map.get(normalized_symbol, set())
-            
+
             if not bybit_cats:
                 continue
 
             # Формируем bybit_symbol (для spot обычно SYMBOL+USDT)
             # Если в категориях есть "linear" - это фьючерсы, иначе spot
             bybit_symbol = f"{normalized_symbol}USDT"
-            
+
+            # Store categories as comma-separated string for filtering
+            categories_str = ",".join(sorted(bybit_cats))
+
             tokens_to_sync.append({
                 "symbol": normalized_symbol,
                 "bybit_symbol": bybit_symbol,
                 "name": t.name,
                 "market_cap_usd": int(t.market_cap_usd),
+                "bybit_categories": categories_str,
                 "is_active": True,
             })
-            
+
             synced_symbols.add(normalized_symbol)
 
         # Сортируем по market cap (от большего к меньшему)
@@ -225,6 +229,7 @@ async def sync_tokens_to_database(
                     "bybit_symbol": token_data["bybit_symbol"],
                     "name": token_data["name"],
                     "market_cap_usd": token_data["market_cap_usd"],
+                    "bybit_categories": token_data["bybit_categories"],
                     "is_active": True,
                 }
             )

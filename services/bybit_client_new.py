@@ -415,7 +415,14 @@ class BybitClient:
 
         async def _one(sym: str) -> None:
             async with sem:
-                rows = await self.fetch_1m_history(category=category, symbol=sym, days=days)
+                try:
+                    rows = await self.fetch_1m_history(category=category, symbol=sym, days=days)
+                except BybitAPIError as e:
+                    # Skip symbols that don't exist in this category (e.g., spot-only symbols in linear)
+                    if "Symbol Is Invalid" in str(e) or "retCode=10001" in str(e):
+                        self._log.warning("Skipping %s: symbol not available in '%s' category", sym, category)
+                        return
+                    raise
                 if not rows:
                     return
 
