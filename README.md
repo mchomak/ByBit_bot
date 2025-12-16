@@ -1,239 +1,216 @@
-# ReBuild Trading Bot (Solana × Raydium × ML)
+# Bybit Trading Bot
 
-Production‑ready algorithmic trading bot for **Solana** on DEX **Raydium** using ML models.  
-The bot collects and filters pools, builds a dataset from OHLCV (GeckoTerminal), trains the LSTM model, makes purchase/sale decisions based on the strategy configuration, and sends reports to **Telegram**. It works locally or in Docker. Secrets and keys are available only through environment variables.
+Autonomous trading bot for Bybit Spot market that monitors 300+ coins 24/7, detects impulse movements (abnormal volume + price acceleration), and executes trades with automatic position management.
 
-> **Disclaimer**: The project is provided for educational purposes. Trading crypto assets is risky. Use mock mode/non‑combat wallet at your own risk.
-
----
-
-## Content
-- [Features](#features)
-- [Architecture](#architecture)
-- [Repository structure](#repository-structure)
-- [Quick start](#quick-start)
-  - [Requirements](#requirements)
-  - [Configuration](#configuration)
-- [Work stages](#work-stages)
-  - [1) Collecting and filtering Raydium pools](#1-collecting-and-filtering-raydium-pools)
-  - [2) Dataset formation](#2-dataset-formation)
-  - [3) Model training](#3-model-training)
-  - [4) Validation](#4-validation)
-  - [5) Launching the bot](#5-launching-the-bot)
-- [Strategy parameters](#strategy-parameters)
-- [Docker](#docker)
-- [Testing](#testing)
-- [Practical notes](#practical-notes)
-- [Recommended GitHub tags](#recommended-github-tags)
-- [License](#license)
-
----
-
-## Features
-- **Solana + Raydium**: collecting *all* pools and filtering according to your criteria (liquidity, number of holders, 24h volume, etc.).
-- **Data pipeline**: OHLCV from **GeckoTerminal** → PostgreSQL.
-- **ML**: preprocessing, LSTM training, artifact export (model, scaler, t_scaler), offline threshold validation.
-- **Execution**: entry/exit rules by thresholds, two purchase modes, position limits.
-- **Reporting**: messages in the Telegram channel(s).
-- **Operational practices**: configuration in JSON, secrets from `.env`, launch via Docker or directly from VSCode.
+> **Disclaimer**: This project is provided for educational purposes. Trading crypto assets is risky. Use testnet mode and trade at your own risk.
 
 ---
 
 ## Architecture
 
+The bot is built as an event-driven pipeline:
+
+```
+Data Collection → Signal Detection → Execution → Maintenance → Result
+```
+
 ```mermaid
 flowchart LR
-    A[Raydium pools] -->|filtered pools| B[(PostgreSQL)]
-    A2[GeckoTerminal OHLCV] --> B
-    B --> C[ML preprocessing]
-    C --> D[LSTM training]
-    D --> E[Validation & thresholds]
-    E --> F[Strategy / transaction planner]
-    F --> G[Solana contractor]
-    G --> H[Telegram reports]
+    A[CoinMarketCap] -->|market cap filter| B[MarketUniverseService]
+    C[Bybit API] -->|spot pairs| B
+    B --> D[BybitMarketDataService]
+    D -->|WebSocket 1m klines| E[(MarketDataQueue)]
+    E --> F[StrategyService]
+    F -->|entry/exit signals| G[(TradeSignalQueue)]
+    G --> H[TradingEngine]
+    H -->|orders| I[Bybit REST API]
+    F & H -->|notifications| J[(NotificationQueue)]
+    J --> K[TelegramService]
+```
+
+### Services
+
+1. **MarketUniverseService** - Manages tradeable token list
+   - Fetches coins from CoinMarketCap API
+   - Filters by market cap (> $1M USD)
+   - Maps to Bybit spot pairs (BTC → BTCUSDT)
+   - Refreshes periodically (default: hourly)
+
+2. **BybitMarketDataService** - Real-time market data
+   - REST: Fetches 5-day historical candles
+   - WebSocket: Subscribes to 1m klines for all symbols
+   - Updates candles every second
+   - Cleans old data periodically
+
+3. **StrategyService** - Signal detection
+   - Entry: Abnormal volume + price acceleration
+   - Exit: MA14 crossover (price below 14-period MA)
+   - Respects risk limits and position caps
+
+4. **TradingEngine** - Order execution
+   - Executes market orders via Bybit REST API
+   - Tracks order status
+   - Manages position lifecycle
+
+5. **TelegramService** - User interface
+   - Notifications (signals, trades, errors)
+   - Commands (/start, /status, /positions, /stats, etc.)
+
+### Event Queues
+
+- **MarketDataQueue**: Candle events → StrategyService
+- **TradeSignalQueue**: Trade signals → TradingEngine
+- **NotificationQueue**: Notifications → TelegramService
+
+---
+
+## Quick Start
+
+### Prerequisites
+
+- Python 3.12+
+- PostgreSQL 16+
+- Bybit API keys
+- Telegram bot token
+
+### Installation
+
+1. Clone the repository:
+```bash
+git clone <repo-url>
+cd ByBit_bot
+```
+
+2. Create virtual environment:
+```bash
+python -m venv venv
+source venv/bin/activate  # Linux/Mac
+# or: venv\Scripts\activate  # Windows
+```
+
+3. Install dependencies:
+```bash
+pip install -r requirements.txt
+```
+
+4. Configure environment:
+```bash
+cp .env.example .env
+# Edit .env with your API keys and settings
+```
+
+5. Run the bot:
+```bash
+python -m src.main
+```
+
+### Docker Deployment
+
+```bash
+# Start with docker-compose (includes PostgreSQL)
+docker-compose up -d
+
+# View logs
+docker-compose logs -f bot
 ```
 
 ---
 
-## Repository structure
+## Configuration
 
-```text
-.
-├── core/
-│   ├── main.py                 # launching the bot (locally)
-│   ├── docker_main.py          # Docker entry point
-│   ├── main_config.json        # strategy/path settings
-│   ├── execution/              # tx execution (slippage, retries)
-│   ├── strategy/               # thresholds and sizing rules (buy_mode)
-│   ├── reporters/              # Telegram reports and other sinks
-│   └── utils/                  # logs, metrics, helpers
-├── ml/
-│   ├── use_preprocessor.py     # building dataset
-│   ├── lstm_trainer.py         # train the model (PyTorch)
-│   ├── validate.py             # validation and review of metrics by thresholds
-│   ├── ready_models/           # exported .pth
-│   ├── scalers/                # .joblib for features
-│   └── t_scalers/              # .pt for targets
-├── api/
-│   └── gecko_ohlcv_new.py      # get OHLCV of GeckoTerminal → SQL
-├── tools/
-│   ├── raydium_pools.ipynb     # full acquisition/enrichment of pools → DB
-│   └── ...                     # auxiliary scripts
-├── configs/
-│   ├── dataset_config.yaml     # dataset config example
-│   └── trainer_config.yaml     # training config example
-├── reports/                    # reports and graphs
-├── logs/                       # logs
-├── docker/
-│   ├── Dockerfile
-│   └── docker-compose.yml
-├── tests/                      # pytest (unit/integration/e2e)
-├── .env.example                # sample with empty values
-├── requirements.txt / pyproject.toml
+All settings are in `.env` file. Key parameters:
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `BYBIT_API_KEY` | Bybit API key | - |
+| `BYBIT_API_SECRET` | Bybit API secret | - |
+| `BYBIT_TESTNET` | Use testnet | false |
+| `TELEGRAM_BOT_TOKEN` | Telegram bot token | - |
+| `MIN_MARKET_CAP_USD` | Minimum market cap filter | 1,000,000 |
+| `VOLUME_SPIKE_MULTIPLIER` | Volume threshold multiplier | 1.5 |
+| `MIN_PRICE_CHANGE_PCT` | Minimum price change % | 1.0 |
+| `MA_EXIT_PERIOD` | MA period for exit | 14 |
+| `MAX_POSITIONS` | Max simultaneous positions | 5 |
+| `RISK_PER_TRADE_PCT` | Balance % per trade | 1.0 |
+
+---
+
+## Strategy
+
+### Entry Conditions
+1. **Volume Spike**: Current volume > `VOLUME_SPIKE_MULTIPLIER` × max(5-day volume)
+2. **Price Acceleration**: (Close - Open) / Open × 100 ≥ `MIN_PRICE_CHANGE_PCT`
+3. **Risk Check**: Current positions < `MAX_POSITIONS`
+
+### Exit Conditions
+1. **MA Crossover**: Price crosses below MA14
+
+---
+
+## Telegram Commands
+
+| Command | Description |
+|---------|-------------|
+| `/start` | Register and welcome message |
+| `/status` | Bot status and queue stats |
+| `/positions` | List open positions |
+| `/stats` | Trading statistics |
+| `/setlimit <n>` | Set max positions (1-50) |
+| `/help` | Available commands |
+
+---
+
+## Project Structure
+
+```
+ByBit_bot/
+├── src/
+│   ├── __init__.py
+│   ├── main.py              # Entry point & orchestrator
+│   ├── config/
+│   │   ├── __init__.py
+│   │   └── settings.py      # Configuration settings
+│   ├── db/
+│   │   ├── __init__.py
+│   │   ├── models.py        # SQLAlchemy models
+│   │   ├── database.py      # Database connection
+│   │   └── repository.py    # CRUD operations
+│   ├── services/
+│   │   ├── __init__.py
+│   │   ├── market_universe.py   # Token list management
+│   │   ├── market_data.py       # WebSocket + REST data
+│   │   ├── strategy.py          # Signal detection
+│   │   ├── trading_engine.py    # Order execution
+│   │   └── telegram_service.py  # Bot interface
+│   └── queues/
+│       ├── __init__.py
+│       └── event_bus.py     # Event queues
+├── requirements.txt
+├── Dockerfile
+├── docker-compose.yml
+├── .env.example
 └── README.md
 ```
 
 ---
 
-## Quick start
+## Development
 
-### Requirements
-- Python **3.12+** or Docker
-- PostgreSQL **13+**
-- Available **Solana RPC** (public/paid)
-- Telegram bot token and Channel ID
-
-### Configuration
-
-#### 1) Secrets in `.env`
-Copy `.env.example` → `.env` and fill in:
-
+### Running Tests
 ```bash
-# Solana / Wallet
-SOLANA_RPC_URL=...
-SOL_PRIVATE_KEY=...              # Don't show it to anyone!
-SOL_WALLET_ADDRESS=...
-
-# Database
-POSTGRES_DSN=postgresql://user:pass@host:5432/dbname
-
-# Telegram
-TELEGRAM_BOT_TOKEN=...
-TELEGRAM_CHANNEL_ID=-100XXXXXXXXXX
-
-# External APIs
-RAYDIUM_API_BASE=https://api-v3.raydium.io/
-GECKOTERMINAL_BASE=https://api.geckoterminal.com/
+pytest
 ```
 
-#### 2) Runtime configuration `core/main_config.json`
+### Adding New Features
 
-```json
-{
-  "scaler_path": "ml/scalers/scaler_test_47_fold1.joblib",
-  "model_path": "ml/ready_models/model_test_47_fold1.pth",
-  "t_scaler_path": "ml/t_scalers/t_scaler_test_47_fold1.pt",
-  "report_path": "reports",
-  "tg_channel_id": "-1xxxxxxxxxxxx",
-  "log_path": "logs",
-  "threshold_buy": 0.8,
-  "threshold_sell": 0.6,
-  "buy_mode": "correlation",
-  "max_tokens_cnt": 20,
-  "sol_per_trade": 0.001,
-  "max_alloc_per_pos": 1.0
-}
-```
+The architecture is designed for extension:
 
-- `threshold_buy` — if the model score ≥ threshold → **buy**.
-- `threshold_sell` — if the model score < threshold → **sell**.
-- `buy_mode`:
-  - **correlation** — `sol_per_trade` is **minimum**, allocation is scaled by the confidence of the model, but not higher than `max_alloc_per_pos`. The `max_tokens_cnt` parameter does not limit the purchase until the balance is exhausted.
-  - **max_tokens** — purchase of exactly `sol_per_trade` and no more than `max_tokens_cnt` active positions.
-
----
-
-## Work stages
-
-### 1) Collecting and filtering Raydium pools
-Open the notebook `tools/raydium_pools.ipynb`: get all the pools, filter (Raydium only and according to the criteria of liquidity/holders/volume), enrich and save to the database.
-
-### 2) Dataset formation
-
-```bash
-python ml/use_preprocessor.py   --dsn "$POSTGRES_DSN"   --timeframe day --window 128   --features rsi,ema,corr,vol,spread   --out data/dataset_v1.parquet
-```
-
-### 3) Model training
-
-```bash
-python ml/lstm_trainer.py   --dataset data/dataset_v1.parquet   --model-out ml/ready_models/model_v1.pth   --scaler-out ml/scalers/scaler_v1.joblib   --t-scaler-out ml/t_scalers/t_scaler_v1.pt   --epochs 50 --batch-size 512 --lr 1e-3
-```
-
-### 4) Validation
-
-```bash
-python ml/validate.py   --dataset data/dataset_v1.parquet   --model ml/ready_models/model_v1.pth   --scaler ml/scalers/scaler_v1.joblib   --t-scaler ml/t_scalers/t_scaler_v1.pt   --thresholds 0.5,0.6,0.7,0.8,0.9
-```
-
-The script will output metrics by thresholds and save graphs in `reports/`.
-
-### 5) Launching the bot
-
-**Locally**
-
-```bash
-python core/main.py --config core/main_config.json
-```
-
-**Docker**
-
-```bash
-docker build -t rebuild-bot ./docker
-docker run --rm --env-file .env   -v $(pwd)/core/main_config.json:/app/core/main_config.json   rebuild-bot
-```
-
----
-
-## Strategy parameters
-- **Input**: `score ≥ threshold_buy` → open/increase.
-- **Output**: `score < threshold_sell` → close.
-- **Sizing**:
-  - mode **correlation** (minimum = `sol_per_trade`, confidence scale, cap `max_alloc_per_pos`)
-  - or **max_tokens** (exactly `sol_per_trade`, maximum `max_tokens_cnt`).
-
----
-
-## Docker
-We recommend a multistage build + `.dockerignore`, pinned dependencies and a minimum of artifacts in the runtime layer.  
-The `CMD` example is set to `core/docker_main.py`.
-
----
-
-## Testing
-We use **pytest** (unit/integration/e2e).
-
-Basic launch:
-
-```bash
-python -m pytest -q
-```
-
-Recommended practices: fixtures and mockups for network/chain calls; property‑based tests (Hypothesis) for sizing functions and rules.
-
----
-
-## Practical notes
-- **GeckoTerminal OHLCV**: use the API at the pool address and the desired timeframe.
-- **Solana RPC**: specify a reliable endpoint, provide a backup.
-- **Telegram**: add the bot as an admin to the channel; format messages (`MarkdownV2`/`HTML`).
-
----
-
-## Recommended GitHub tags
-`solana`, `raydium`, `defi`, `dex`, `amm`, `algorithmic-trading`, `trading-bot`, `market-data`, `ohlcv`, `geckoterminal`, `lstm`, `machine-learning`, `time-series`, `pytorch`, `python`, `docker`, `postgresql`, `telegram-bot`, `jupyter-notebook`, `pytest`, `ci-cd`
+1. **New Signal Types**: Add detection logic to `StrategyService._check_entry_conditions()`
+2. **New Exit Rules**: Add logic to `StrategyService._check_exit_conditions()`
+3. **New Commands**: Add handlers in `TelegramService._register_handlers()`
 
 ---
 
 ## License
-MIT or your internal license of choice.
+
+MIT License
