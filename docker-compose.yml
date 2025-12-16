@@ -1,19 +1,41 @@
+# Bybit Trading Bot - Docker Compose Configuration
+version: '3.8'
+
 services:
-  app:
-    build: .
-    image: myapp:gpu
-    # >>> GPU в Compose (официальный способ)
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all           # или 1 / 2
-              capabilities: [gpu]
-    # >>> Передаем env
-    env_file:
-      - .env                      # чтобы DATABASE_URL попал внутрь
+  # PostgreSQL Database
+  postgres:
+    image: postgres:16-alpine
+    container_name: bybit_bot_db
     environment:
-      # опционально продублировать критичное
-      - DATABASE_URL=${DATABASE_URL}
-    command: python -m core.main_docker
+      POSTGRES_DB: ${DB_NAME:-bybit_bot}
+      POSTGRES_USER: ${DB_USER:-bot_user}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-changeme}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-bot_user} -d ${DB_NAME:-bybit_bot}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Trading Bot Application
+  bot:
+    build: .
+    container_name: bybit_trading_bot
+    env_file:
+      - .env
+    environment:
+      # Override DATABASE_URL to use Docker network
+      DATABASE_URL: postgresql+asyncpg://${DB_USER:-bot_user}:${DB_PASSWORD:-changeme}@postgres:5432/${DB_NAME:-bybit_bot}
+    volumes:
+      - ./logs:/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
