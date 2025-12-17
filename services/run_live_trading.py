@@ -2,10 +2,10 @@
 Live Trading Pipeline Runner.
 
 Production-grade runner that orchestrates all pipeline components:
-- WS Candles Service (Producer)
-- Strategy Engine (Consumer/Producer)
-- DB Writer (Consumer)
-- Execution Engine (Consumer)
+- BybitClient (WebSocket Producer)
+- StrategyEngine (Consumer/Producer)
+- CandleWriterService (Consumer)
+- ExecutionEngine (Consumer)
 
 Features:
 - Graceful shutdown on SIGINT/SIGTERM
@@ -24,23 +24,19 @@ import sys
 from datetime import datetime, timezone
 from typing import List, Optional
 
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import sessionmaker
-
-# Add parent directory to path for imports
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from config.config import settings
+from db.database import Database, CandleWriterService
 from db.models import Candle1m, Position, Order, Signal, Token
 from db.repository import Repository
+
 from services.pipeline_events import PipelineMetrics
-from services.ws_candles_service import WSCandlesService
 from services.strategy_engine import StrategyEngine
-from services.db_writer import DBWriterService
+from services.bybit_client import BybitClient
 from services.execution_engine import ExecutionEngine
 
 
-# Configure logging
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s | %(levelname)-8s | %(name)s:%(lineno)d - %(message)s",
@@ -61,7 +57,6 @@ async def load_active_symbols(
     for t in tokens:
         if not t.bybit_symbol:
             continue
-        # Filter by category if specified
         if category and t.bybit_categories:
             available = [c.strip().lower() for c in t.bybit_categories.split(",")]
             if category.strip().lower() not in available:
@@ -73,14 +68,14 @@ async def load_active_symbols(
 
 async def bootstrap_strategy(
     strategy: StrategyEngine,
-    db_writer: DBWriterService,
+    candle_writer: CandleWriterService,
     symbols: List[str],
 ) -> None:
     """Bootstrap strategy engine with historical data."""
     log.info("Bootstrapping strategy with historical data...")
 
     for symbol in symbols:
-        candles = await db_writer.get_recent_candles(symbol, limit=7200)
+        candles = await candle_writer.get_recent_candles(symbol, limit=7200)
         if candles:
             strategy.load_historical_data(symbol, candles)
             log.debug("Loaded %d candles for %s", len(candles), symbol)
@@ -117,31 +112,25 @@ async def main() -> None:
 
     # Configuration
     category = settings.bybit_category
-    ws_domain = settings.bybit_ws_domain
     max_symbols = settings.max_symbols or None
     max_positions = settings.max_positions
-    risk_pct = 5.0  # Fixed 5% risk per trade as per requirements
+    risk_pct = 5.0  # Fixed 5% risk per trade
 
     log.info("Category: %s", category)
-    log.info("WS Domain: %s", ws_domain)
     log.info("Max Positions: %d", max_positions)
     log.info("Risk Per Trade: %.1f%%", risk_pct)
     log.info("=" * 60)
 
     # Database setup
-    engine = create_async_engine(
-        settings.database_url,
-        pool_pre_ping=True,
-        pool_size=10,
-        max_overflow=20,
-    )
-    session_factory = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-    repo = Repository(session_factory)
+    db = Database(settings.database_url)
+    await db.create_tables()
+    repo = Repository(db.session_factory)
 
     # Load active symbols
     symbols = await load_active_symbols(repo, category, max_symbols)
     if not symbols:
         log.error("No active symbols found. Run token_sync.py first.")
+        await db.close()
         return
 
     log.info("Loaded %d active symbols", len(symbols))
@@ -154,16 +143,21 @@ async def main() -> None:
     db_write_queue: asyncio.Queue = asyncio.Queue(maxsize=50000)
     signal_queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
 
+    # Shutdown event
+    stop_event = asyncio.Event()
+
+    def signal_handler(sig, frame):
+        log.info("Received signal %s, initiating shutdown...", sig)
+        stop_event.set()
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
     # Create services
-    ws_service = WSCandlesService(
-        symbols=symbols,
-        output_queue=marketdata_queue,
-        category=category,
-        ws_domain=ws_domain,
-        ping_interval_s=settings.bybit_ws_ping_interval_s,
-        subscribe_chunk_size=10 if category == "spot" else 200,
-        metrics=metrics,
-        logger=logging.getLogger("ws-candles"),
+    bybit_client = BybitClient(
+        base_url=settings.bybit_rest_base_url,
+        ws_domain=settings.bybit_ws_domain,
+        testnet=settings.bybit_testnet,
     )
 
     strategy_engine = StrategyEngine(
@@ -172,25 +166,25 @@ async def main() -> None:
         signal_queue=signal_queue,
         volume_window_minutes=7200,  # 5 days
         ma_period=14,
-        price_acceleration_factor=3.0,  # close >= open * 3
+        price_acceleration_factor=3.0,
         metrics=metrics,
         logger=logging.getLogger("strategy"),
     )
 
-    db_writer = DBWriterService(
+    candle_writer = CandleWriterService(
         input_queue=db_write_queue,
-        session_factory=session_factory,
+        session_factory=db.session_factory,
         candle_model=Candle1m,
         flush_interval_s=settings.flush_interval_s,
         retention_days=settings.keep_days,
         cleanup_interval_minutes=settings.candle_cleanup_interval_minutes,
         metrics=metrics,
-        logger=logging.getLogger("db-writer"),
+        logger=logging.getLogger("candle-writer"),
     )
 
     execution_engine = ExecutionEngine(
         signal_queue=signal_queue,
-        session_factory=session_factory,
+        session_factory=db.session_factory,
         position_model=Position,
         order_model=Order,
         signal_model=Signal,
@@ -202,28 +196,30 @@ async def main() -> None:
         logger=logging.getLogger("execution"),
     )
 
-    # Shutdown event
-    stop_event = asyncio.Event()
-
-    def signal_handler(sig, frame):
-        log.info("Received signal %s, initiating shutdown...", sig)
-        stop_event.set()
-
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-
     # Start services
     try:
-        # Start DB writer first (needed for bootstrap)
-        await db_writer.start()
+        # Start candle writer first (needed for bootstrap)
+        await candle_writer.start()
 
         # Bootstrap strategy with historical data
-        await bootstrap_strategy(strategy_engine, db_writer, symbols)
+        await bootstrap_strategy(strategy_engine, candle_writer, symbols)
 
         # Start remaining services
         await strategy_engine.start()
         await execution_engine.start()
-        await ws_service.start()
+
+        # Start WebSocket streaming task
+        ws_task = asyncio.create_task(
+            bybit_client.stream_klines_to_queue(
+                category=category,
+                symbols=symbols,
+                output_queue=marketdata_queue,
+                ping_interval_s=settings.bybit_ws_ping_interval_s,
+                metrics=metrics,
+                stop_event=stop_event,
+            ),
+            name="ws-stream"
+        )
 
         log.info("All services started. Running until interrupted...")
 
@@ -238,29 +234,34 @@ async def main() -> None:
 
         log.info("Shutdown signal received, stopping services...")
 
-        # Cancel metrics task
+        # Cancel helper tasks
         metrics_task.cancel()
+        ws_task.cancel()
         try:
             await metrics_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            await ws_task
         except asyncio.CancelledError:
             pass
 
     finally:
         # Stop services in reverse order
-        log.info("Stopping WebSocket service...")
-        await ws_service.stop()
-
         log.info("Stopping strategy engine...")
         await strategy_engine.stop()
 
         log.info("Stopping execution engine...")
         await execution_engine.stop()
 
-        log.info("Stopping DB writer (flushing pending writes)...")
-        await db_writer.stop()
+        log.info("Stopping candle writer (flushing pending writes)...")
+        await candle_writer.stop()
+
+        # Close Bybit client
+        await bybit_client.close()
 
         # Close database
-        await engine.dispose()
+        await db.close()
 
         # Final metrics
         final_metrics = metrics.snapshot()

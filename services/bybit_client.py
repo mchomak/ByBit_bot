@@ -7,13 +7,19 @@ import logging
 import random
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, AsyncIterator, Dict, List, Optional, Set, Tuple
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Set, Tuple
 
 import aiohttp
 from aiohttp import ClientWebSocketResponse
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import sessionmaker
+import sys
+import os
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from config.config import Settings
+from pipeline_events import CandleUpdate, PipelineMetrics
 
 
 @dataclass(frozen=True)
@@ -27,15 +33,6 @@ class BybitInstrument:
 
 class BybitAPIError(RuntimeError):
     """Raised when Bybit returns non-zero retCode or malformed response."""
-
-
-@dataclass
-class CandleBufferMetrics:
-    """Metrics for candle buffer operations."""
-    messages_received: int = 0
-    rows_upserted: int = 0
-    flush_count: int = 0
-    errors: int = 0
 
 
 class _CandleUpsertBuffer:
@@ -68,7 +65,6 @@ class _CandleUpsertBuffer:
         self._buf: Dict[Tuple[str, datetime], Dict[str, Any]] = {}
         self._stop = asyncio.Event()
         self._task: Optional[asyncio.Task] = None
-        self.metrics = CandleBufferMetrics()
 
     async def start(self) -> None:
         if self._task is None:
@@ -84,7 +80,6 @@ class _CandleUpsertBuffer:
         key = (row["symbol"], row["timestamp"])
         async with self._lock:
             self._buf[key] = row
-            self.metrics.messages_received += 1
 
     async def flush_now(self) -> int:
         async with self._lock:
@@ -93,29 +88,23 @@ class _CandleUpsertBuffer:
             rows = list(self._buf.values())
             self._buf.clear()
 
-        try:
-            async with self._session_factory() as session:
-                stmt = pg_insert(self._model).values(rows)
-                update_cols = {
-                    "open": stmt.excluded.open,
-                    "high": stmt.excluded.high,
-                    "low": stmt.excluded.low,
-                    "close": stmt.excluded.close,
-                    "volume": stmt.excluded.volume,
-                    "turnover": stmt.excluded.turnover,
-                    "is_confirmed": stmt.excluded.is_confirmed,
-                }
-                stmt = stmt.on_conflict_do_update(
-                    index_elements=["symbol", "timestamp"],
-                    set_=update_cols,
-                )
-                await session.execute(stmt)
-                await session.commit()
-            self.metrics.rows_upserted += len(rows)
-            self.metrics.flush_count += 1
-        except Exception:
-            self.metrics.errors += 1
-            raise
+        async with self._session_factory() as session:
+            stmt = pg_insert(self._model).values(rows)
+            update_cols = {
+                "open": stmt.excluded.open,
+                "high": stmt.excluded.high,
+                "low": stmt.excluded.low,
+                "close": stmt.excluded.close,
+                "volume": stmt.excluded.volume,
+                "turnover": stmt.excluded.turnover,
+                "is_confirmed": stmt.excluded.is_confirmed,
+            }
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["symbol", "timestamp"],
+                set_=update_cols,
+            )
+            await session.execute(stmt)
+            await session.commit()
 
         return len(rows)
 
@@ -432,14 +421,7 @@ class BybitClient:
 
         async def _one(sym: str) -> None:
             async with sem:
-                try:
-                    rows = await self.fetch_1m_history(category=category, symbol=sym, days=days)
-                except BybitAPIError as e:
-                    # Skip symbols that don't exist in this category (e.g., spot-only symbols in linear)
-                    if "Symbol Is Invalid" in str(e) or "retCode=10001" in str(e):
-                        self._log.warning("Skipping %s: symbol not available in '%s' category", sym, category)
-                        return
-                    raise
+                rows = await self.fetch_1m_history(category=category, symbol=sym, days=days)
                 if not rows:
                     return
 
@@ -535,8 +517,7 @@ class BybitClient:
         candle_model: Any,
         flush_interval_s: float = 1.0,
         reconnect_backoff_s: float = 2.0,
-        duration_s: Optional[float] = None,
-    ) -> CandleBufferMetrics:
+    ) -> None:
         """
         Subscribe to kline.1 for symbols and write updates to PostgreSQL.
 
@@ -545,22 +526,10 @@ class BybitClient:
           - Sends ping every ~20s (recommended by Bybit)
           - Batch UPSERTs to candles_1m every flush_interval_s seconds
           - Auto-reconnects each connection independently
-
-        Args:
-            category: Bybit market category (spot, linear, inverse, option)
-            symbols: List of symbols to subscribe to
-            session_factory: SQLAlchemy async session factory
-            candle_model: SQLAlchemy model for candles table
-            flush_interval_s: How often to flush buffer to DB
-            reconnect_backoff_s: Base backoff time for reconnection
-            duration_s: Optional duration in seconds; if set, stops after this time
-
-        Returns:
-            CandleBufferMetrics with counts of messages received and rows upserted
         """
         if not symbols:
             self._log.warning("No symbols provided for WS stream; exiting")
-            return CandleBufferMetrics()
+            return
 
         topics = [f"kline.1.{s}" for s in symbols]
         topic_groups = self._split_topics_for_connection(topics)
@@ -573,16 +542,6 @@ class BybitClient:
         )
         await buffer.start()
 
-        # If duration is set, schedule a stop event
-        stop_event = asyncio.Event()
-        duration_task: Optional[asyncio.Task] = None
-        if duration_s is not None and duration_s > 0:
-            async def _stop_after_duration():
-                await asyncio.sleep(duration_s)
-                self._log.info("Duration limit reached (%.1fs), stopping stream...", duration_s)
-                stop_event.set()
-            duration_task = asyncio.create_task(_stop_after_duration(), name="duration-limit")
-
         async def _run_one_connection(group_topics: List[str]) -> None:
             attempt = 0
 
@@ -590,7 +549,7 @@ class BybitClient:
             # For linear/inverse there is no explicit args-per-request cap "for now", but we still chunk.
             per_request = 10 if category.strip().lower() == "spot" else 200
 
-            while not stop_event.is_set():
+            while True:
                 ws: Optional[ClientWebSocketResponse] = None
                 ping_task: Optional[asyncio.Task] = None
                 try:
@@ -610,10 +569,6 @@ class BybitClient:
                     attempt = 0
 
                     async for msg in ws:
-                        # Check if we should stop
-                        if stop_event.is_set():
-                            break
-
                         if msg.type == aiohttp.WSMsgType.TEXT:
                             try:
                                 payload = json.loads(msg.data)
@@ -655,8 +610,6 @@ class BybitClient:
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:  # noqa: BLE001
-                    if stop_event.is_set():
-                        break
                     attempt += 1
                     sleep_s = min(60.0, reconnect_backoff_s * (2 ** min(attempt, 6)))
                     self._log.warning("WS error: %s. Reconnect in %.1fs", e, sleep_s)
@@ -673,33 +626,183 @@ class BybitClient:
         tasks = [asyncio.create_task(_run_one_connection(g)) for g in topic_groups]
 
         try:
-            # Wait for either all tasks to complete or stop_event to be set
-            if duration_task:
-                done, pending = await asyncio.wait(
-                    tasks + [duration_task],
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                # If duration task completed, cancel others
-                if duration_task in done:
-                    for t in tasks:
-                        t.cancel()
-            else:
-                await asyncio.gather(*tasks)
+            await asyncio.gather(*tasks)
         finally:
-            # Cancel duration task if still running
-            if duration_task and not duration_task.done():
-                duration_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await duration_task
-            # Cancel all connection tasks
+            for t in tasks:
+                t.cancel()
+            with contextlib.suppress(Exception):
+                await asyncio.gather(*tasks)
+            with contextlib.suppress(Exception):
+                await buffer.flush_now()
+            await buffer.stop()
+
+    # -------------------------------------------------------------------------
+    # WebSocket kline stream to Queue (for pipeline architecture)
+    # -------------------------------------------------------------------------
+
+    async def stream_klines_to_queue(
+        self,
+        *,
+        category: str,
+        symbols: List[str],
+        output_queue: asyncio.Queue,
+        ping_interval_s: float = 20.0,
+        reconnect_backoff_s: float = 2.0,
+        metrics: Optional[PipelineMetrics] = None,
+        stop_event: Optional[asyncio.Event] = None,
+    ) -> None:
+        """
+        Stream kline updates to a queue instead of directly to DB.
+
+        This method is designed for the event-driven pipeline architecture where
+        candle updates are processed by downstream consumers.
+
+        Args:
+            category: Bybit category (spot, linear, inverse, option)
+            symbols: List of symbols to subscribe to
+            output_queue: Bounded asyncio.Queue to push CandleUpdate events
+            ping_interval_s: Interval for heartbeat pings (~20s recommended)
+            reconnect_backoff_s: Base backoff for reconnection
+            metrics: Optional PipelineMetrics for tracking
+            stop_event: Optional event to signal graceful shutdown
+        """
+        if not symbols:
+            self._log.warning("No symbols provided for WS stream; exiting")
+            return
+
+        stop = stop_event or asyncio.Event()
+        topics = [f"kline.1.{s}" for s in symbols]
+        topic_groups = self._split_topics_for_connection(topics)
+
+        self._log.info(
+            "Starting WS kline stream: %d symbols, %d connections",
+            len(symbols), len(topic_groups)
+        )
+
+        async def _run_connection(group_topics: List[str], conn_id: int) -> None:
+            attempt = 0
+            per_request = 10 if category.strip().lower() == "spot" else 200
+
+            while not stop.is_set():
+                ws: Optional[ClientWebSocketResponse] = None
+                ping_task: Optional[asyncio.Task] = None
+
+                try:
+                    await self._ensure_session()
+                    assert self._session is not None
+
+                    ws_url = self._ws_base_url(category)
+                    self._log.info(
+                        "[conn-%d] Connecting to %s (topics=%d)",
+                        conn_id, ws_url, len(group_topics)
+                    )
+
+                    ws = await self._session.ws_connect(ws_url, autoping=False)
+                    ping_task = asyncio.create_task(
+                        self._ws_ping_loop(ws, ping_interval_s),
+                        name=f"ws-ping-{conn_id}"
+                    )
+
+                    # Subscribe in chunks
+                    for chunk in self._chunk(group_topics, size=per_request):
+                        await self._ws_send(ws, {"op": "subscribe", "args": chunk})
+                        await asyncio.sleep(0.05)
+
+                    attempt = 0  # Reset on successful connect
+
+                    # Message loop
+                    async for msg in ws:
+                        if stop.is_set():
+                            break
+
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            try:
+                                payload = json.loads(msg.data)
+                            except json.JSONDecodeError:
+                                continue
+
+                            op = payload.get("op")
+                            if op in {"pong", "ping"}:
+                                continue
+                            if payload.get("type") == "COMMAND_RESP":
+                                continue
+
+                            topic = payload.get("topic", "")
+                            if not topic.startswith("kline."):
+                                continue
+
+                            sym = topic.split(".")[-1]
+                            for c in payload.get("data", []) or []:
+                                try:
+                                    update = self._parse_candle_update(sym, c)
+                                    if update:
+                                        try:
+                                            output_queue.put_nowait(update)
+                                            if metrics:
+                                                metrics.ws_messages_received += 1
+                                        except asyncio.QueueFull:
+                                            self._log.warning(
+                                                "Queue full, dropping update for %s", sym
+                                            )
+                                except Exception as e:
+                                    self._log.debug("Bad kline payload: %r (%s)", c, e)
+
+                        elif msg.type in {aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR}:
+                            raise ConnectionError(f"WS closed/error: {msg.type}")
+
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    if stop.is_set():
+                        break
+                    attempt += 1
+                    sleep_s = min(60.0, reconnect_backoff_s * (2 ** min(attempt, 6)))
+                    self._log.warning(
+                        "[conn-%d] Error: %s. Reconnect in %.1fs",
+                        conn_id, e, sleep_s
+                    )
+                    if metrics:
+                        metrics.errors += 1
+                    await asyncio.sleep(sleep_s)
+                finally:
+                    if ping_task:
+                        ping_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await ping_task
+                    if ws is not None:
+                        with contextlib.suppress(Exception):
+                            await ws.close()
+
+        tasks = [
+            asyncio.create_task(_run_connection(g, i), name=f"ws-conn-{i}")
+            for i, g in enumerate(topic_groups)
+        ]
+
+        try:
+            await asyncio.gather(*tasks)
+        finally:
             for t in tasks:
                 if not t.done():
                     t.cancel()
             with contextlib.suppress(Exception):
                 await asyncio.gather(*tasks, return_exceptions=True)
-            # Final flush
-            with contextlib.suppress(Exception):
-                await buffer.flush_now()
-            await buffer.stop()
 
-        return buffer.metrics
+    def _parse_candle_update(self, symbol: str, data: Dict[str, Any]) -> Optional[CandleUpdate]:
+        """Parse raw WS candle data into CandleUpdate event."""
+        try:
+            ts_ms = int(data["start"])
+            timestamp = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+
+            return CandleUpdate(
+                symbol=symbol,
+                timestamp=timestamp,
+                open=float(data["open"]),
+                high=float(data["high"]),
+                low=float(data["low"]),
+                close=float(data["close"]),
+                volume=float(data["volume"]),
+                turnover=float(data["turnover"]) if data.get("turnover") is not None else None,
+                confirm=bool(data.get("confirm", False)),
+            )
+        except (KeyError, ValueError, TypeError) as e:
+            raise ValueError(f"Invalid candle data: {e}") from e

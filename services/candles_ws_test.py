@@ -32,18 +32,15 @@ import sys
 from datetime import datetime, timezone
 from typing import List, Optional
 
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import sessionmaker
-
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from config.config import settings
+from db.database import Database, CandleWriterService
 from db.models import Candle1m, Position, Order, Signal, Token
 from db.repository import Repository
+from services.bybit_client import BybitClient
 from services.pipeline_events import PipelineMetrics
-from services.ws_candles_service import WSCandlesService
 from services.strategy_engine import StrategyEngine
-from services.db_writer import DBWriterService
 from services.execution_engine import ExecutionEngine
 
 
@@ -140,7 +137,7 @@ async def log_periodic_status(
 
 async def bootstrap_strategy(
     strategy: StrategyEngine,
-    db_writer: DBWriterService,
+    candle_writer: CandleWriterService,
     symbols: List[str],
 ) -> None:
     """Bootstrap strategy engine with historical data."""
@@ -148,7 +145,7 @@ async def bootstrap_strategy(
 
     loaded = 0
     for symbol in symbols:
-        candles = await db_writer.get_recent_candles(symbol, limit=7200)
+        candles = await candle_writer.get_recent_candles(symbol, limit=7200)
         if candles:
             strategy.load_historical_data(symbol, candles)
             loaded += 1
@@ -160,7 +157,6 @@ async def main() -> None:
     """Main test runner."""
     # Configuration
     category = os.getenv("BYBIT_CATEGORY", settings.bybit_category).strip().lower()
-    ws_domain = settings.bybit_ws_domain
     test_duration_minutes = int(os.getenv("TEST_DURATION_MINUTES", "60"))
     test_duration_s = test_duration_minutes * 60
     max_symbols = int(os.getenv("MAX_SYMBOLS", "0")) or None
@@ -170,21 +166,15 @@ async def main() -> None:
     log.info("BYBIT TRADING PIPELINE TEST")
     log.info("=" * 70)
     log.info("Category: %s", category)
-    log.info("WS Domain: %s", ws_domain)
     log.info("Test Duration: %d minutes", test_duration_minutes)
     log.info("Max Symbols: %s", max_symbols or "unlimited")
     log.info("Flush Interval: %.1fs", flush_interval_s)
     log.info("=" * 70)
 
     # Database setup
-    engine = create_async_engine(
-        settings.database_url,
-        pool_pre_ping=True,
-        pool_size=10,
-        max_overflow=20,
-    )
-    session_factory = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-    repo = Repository(session_factory)
+    db = Database(settings.database_url)
+    await db.create_tables()
+    repo = Repository(db.session_factory)
 
     # Load symbols
     symbols = await load_symbols(repo, limit=max_symbols, category=category)
@@ -194,7 +184,7 @@ async def main() -> None:
             "Run token_sync.py first to populate tokens.",
             category,
         )
-        await engine.dispose()
+        await db.close()
         return
 
     log.info("Loaded %d symbols for category '%s'", len(symbols), category)
@@ -207,16 +197,21 @@ async def main() -> None:
     db_write_queue: asyncio.Queue = asyncio.Queue(maxsize=50000)
     signal_queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
 
+    # Shutdown event
+    stop_event = asyncio.Event()
+
+    def signal_handler(sig, frame):
+        log.info("Received signal %s, initiating shutdown...", sig)
+        stop_event.set()
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
     # Create services
-    ws_service = WSCandlesService(
-        symbols=symbols,
-        output_queue=marketdata_queue,
-        category=category,
-        ws_domain=ws_domain,
-        ping_interval_s=20.0,
-        subscribe_chunk_size=10 if category == "spot" else 200,
-        metrics=metrics,
-        logger=logging.getLogger("ws-candles"),
+    bybit_client = BybitClient(
+        base_url=settings.bybit_rest_base_url,
+        ws_domain=settings.bybit_ws_domain,
+        testnet=settings.bybit_testnet,
     )
 
     strategy_engine = StrategyEngine(
@@ -230,20 +225,20 @@ async def main() -> None:
         logger=logging.getLogger("strategy"),
     )
 
-    db_writer = DBWriterService(
+    candle_writer = CandleWriterService(
         input_queue=db_write_queue,
-        session_factory=session_factory,
+        session_factory=db.session_factory,
         candle_model=Candle1m,
         flush_interval_s=flush_interval_s,
         retention_days=settings.keep_days,
         cleanup_interval_minutes=120,  # Less frequent cleanup for test
         metrics=metrics,
-        logger=logging.getLogger("db-writer"),
+        logger=logging.getLogger("candle-writer"),
     )
 
     execution_engine = ExecutionEngine(
         signal_queue=signal_queue,
-        session_factory=session_factory,
+        session_factory=db.session_factory,
         position_model=Position,
         order_model=Order,
         signal_model=Signal,
@@ -254,16 +249,6 @@ async def main() -> None:
         metrics=metrics,
         logger=logging.getLogger("execution"),
     )
-
-    # Shutdown event
-    stop_event = asyncio.Event()
-
-    def signal_handler(sig, frame):
-        log.info("Received signal %s, initiating shutdown...", sig)
-        stop_event.set()
-
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
 
     # Duration timer
     async def duration_timer():
@@ -276,16 +261,28 @@ async def main() -> None:
 
     # Start services
     try:
-        # Start DB writer first
-        await db_writer.start()
+        # Start candle writer first
+        await candle_writer.start()
 
         # Bootstrap strategy
-        await bootstrap_strategy(strategy_engine, db_writer, symbols)
+        await bootstrap_strategy(strategy_engine, candle_writer, symbols)
 
         # Start remaining services
         await strategy_engine.start()
         await execution_engine.start()
-        await ws_service.start()
+
+        # Start WebSocket streaming task
+        ws_task = asyncio.create_task(
+            bybit_client.stream_klines_to_queue(
+                category=category,
+                symbols=symbols,
+                output_queue=marketdata_queue,
+                ping_interval_s=20.0,
+                metrics=metrics,
+                stop_event=stop_event,
+            ),
+            name="ws-stream"
+        )
 
         # Start duration timer
         timer_task = asyncio.create_task(duration_timer(), name="duration-timer")
@@ -304,6 +301,7 @@ async def main() -> None:
         # Cancel helper tasks
         timer_task.cancel()
         status_task.cancel()
+        ws_task.cancel()
         try:
             await timer_task
         except asyncio.CancelledError:
@@ -312,15 +310,19 @@ async def main() -> None:
             await status_task
         except asyncio.CancelledError:
             pass
+        try:
+            await ws_task
+        except asyncio.CancelledError:
+            pass
 
     finally:
         # Stop services in reverse order
         log.info("Stopping services...")
 
-        await ws_service.stop()
         await strategy_engine.stop()
         await execution_engine.stop()
-        await db_writer.stop()
+        await candle_writer.stop()
+        await bybit_client.close()
 
         # Calculate duration
         end_time = datetime.now(timezone.utc)
@@ -330,7 +332,7 @@ async def main() -> None:
         print_metrics(metrics, actual_duration_s, len(symbols))
 
         # Cleanup
-        await engine.dispose()
+        await db.close()
         log.info("Test completed. Database connections closed.")
 
 
