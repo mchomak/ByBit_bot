@@ -10,7 +10,7 @@ import sys
 import os
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from bybit_client import BybitClient
+from services.bybit_client import BybitClient
 from db.repository import Repository
 from db.models import Token
 

@@ -61,16 +61,6 @@ def setup_logging(log_dir: str | Path, telegram_queue: asyncio.Queue[str] | None
         format="{time:YYYY-MM-DD HH:mm:ss} | {level:<8} | {message}"
     )
 
-    # 2) Логи по транзакциям
-    logger.add(
-        log_dir / "trading.log",
-        level="TRACE",
-        filter=lambda r: r["extra"].get("stream") == "trading",
-        rotation="1 week",
-        enqueue=True,
-        format="{time:YYYY-MM-DD HH:mm:ss} | {level:<8} | {message}"
-    )
-
     # 3) Важные логи — INFO и выше
     logger.add(
         log_dir / "important.log",

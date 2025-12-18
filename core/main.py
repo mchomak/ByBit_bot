@@ -1,519 +1,629 @@
-"""Main module for the Solana trading bot system."""
+"""
+Main entry point for the Bybit Trading Bot.
+
+This script orchestrates all trading bot components:
+- WebSocket candle ingestion from Bybit
+- Strategy engine for entry/exit signal generation
+- Execution engine for order placement
+- Database persistence for candles, positions, and signals
+- Telegram notifications for trading decisions
+- Daily token universe synchronization
+
+Usage:
+    python run_live_trading.py
+
+Configuration:
+    All settings are loaded from config/config.py and .env file.
+    See .env.example for required environment variables.
+"""
 
 from __future__ import annotations
+
+import asyncio
+import signal
+import sys
+from datetime import datetime, timedelta, time as dt_time, timezone
+from pathlib import Path
+from typing import List, Optional, Set
 import os
 import sys
-
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from core.bootstrap_logging import setup_logging
-from ml.ml_utils import create_all_tables, get_device, load_model
-from bot.TelegramNotifier import TelegramNotifier
-from tx_tools.transaction_processor import TransactionProcessor
-from db.db_reader import DatabaseReader
-from db.db_writer import DatabaseWriter
-from config.config import *
-from db.models import *
-from services.get_price_tracker import PriceFetcher
-from db.db_ohlcv_creator import OHLCVService
-from services.gecko_ohlcv_new import OHLCVFFREEAPI
-from ml.preprocessor import Preprocessor
-from core.business_logic import decide_token
-from core.create_daily_report import daily_report
-from ml.lstm_predictor import LSTMPredictor
-from tx_tools.raydium_trader import RaydiumTrader
-from services.sol_price_client import SolanaTokenPriceClient
-from core.main_config import config
-
-from datetime import datetime, timezone
-import asyncio
-from pathlib import Path
-from typing import Any, Dict
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import pytz
 from loguru import logger
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import sessionmaker
-import joblib
+
+# Add project root to path
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from config.config import settings
+from core.bootstrap_logging import setup_logging
+from bot.TelegramNotifier import TelegramNotifier
+from db.database import Database, CandleWriterService
+from db.models import Candle1m, Position, Order, Signal, Token
+from db.repository import Repository
+from services.bybit_client import BybitClient
+from services.pipeline_events import PipelineMetrics, CandleUpdate, TradingSignal, SignalType
+from services.strategy_engine import StrategyEngine
+from services.execution_engine import ExecutionEngine
+from services.token_sync_service import TokenSyncService
 
 
-class TraidingBot:
-    """Main orchestrator for the Solana trading system."""
+class TradingBot:
+    """
+    Main trading bot orchestrator.
 
-    # --- 1. INIT -----------------------------------------------------------------
-    def __init__(self, config: str | Path) -> None:
-        self.cfg: Dict[str, Any] = config
-        self.loop = asyncio.get_event_loop()
+    Coordinates all components:
+    - WebSocket candle streaming
+    - Strategy evaluation
+    - Order execution
+    - Database persistence
+    - Telegram notifications
+    - Daily token sync
+    """
 
-        # queues
-        self.db_queue: asyncio.Queue = asyncio.Queue(maxsize=1_000)
-        self.message_queue: asyncio.Queue = asyncio.Queue(maxsize=100)
-        self.trade_queue: asyncio.Queue = asyncio.Queue(maxsize=100)
-        self.price_queue: asyncio.Queue = asyncio.Queue(maxsize=1_000)
-        self.database_url = DATABASE_URL
+    def __init__(self) -> None:
+        """Initialize the trading bot with configuration."""
+        self._stop_event = asyncio.Event()
+        self._shutdown_complete = asyncio.Event()
 
+        # Queues for pipeline communication
+        self._marketdata_queue: asyncio.Queue[CandleUpdate] = asyncio.Queue(maxsize=10000)
+        self._db_write_queue: asyncio.Queue = asyncio.Queue(maxsize=50000)
+        self._signal_queue: asyncio.Queue[TradingSignal] = asyncio.Queue(maxsize=1000)
+        self._telegram_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=500)
 
-    async def setup(self) -> None:
-        """Heavy initialisation performed explicitly after __init__."""
-        log = logger.bind(component="TraidingBot.setup")
+        # Shared metrics
+        self._metrics = PipelineMetrics()
 
-        # 2.1 Logger
-        self._configure_logger()
-        log.info("Logger configured")
+        # Components (initialized in start())
+        self._db: Optional[Database] = None
+        self._repository: Optional[Repository] = None
+        self._bybit_client: Optional[BybitClient] = None
+        self._candle_writer: Optional[CandleWriterService] = None
+        self._strategy_engine: Optional[StrategyEngine] = None
+        self._execution_engine: Optional[ExecutionEngine] = None
+        self._token_sync_service: Optional[TokenSyncService] = None
+        self._telegram_notifier: Optional[TelegramNotifier] = None
 
-        # 2.1.1 Device
-        self.device = get_device()
-        log.info("Device selected: {}", self.device)
+        # Task handles
+        self._ws_task: Optional[asyncio.Task] = None
+        self._token_sync_scheduler_task: Optional[asyncio.Task] = None
+        self._metrics_reporter_task: Optional[asyncio.Task] = None
 
-        # 2.2 Database engine & tables
-        self.db_engine = create_async_engine(self.database_url, echo=False, future=True)
-        self.SQLSession = sessionmaker(self.db_engine, class_=AsyncSession, expire_on_commit=False)
-        await create_all_tables(self.db_engine)
-        log.info("Database engine created and tables ensured")
+        # Trading logger for buy/sell decisions
+        self._trading_log = logger.bind(stream="trading")
 
-        # 2.2.1 Reader & Writer
-        self.db_reader = DatabaseReader(self.SQLSession)
-        log.info("DatabaseReader initialized")
-        self.db_writer = DatabaseWriter(self.SQLSession)
-        log.info("DatabaseWriter initialized")
-
-        # 2.4 ML-модель
-        self.model, dataset_cfg, train_cfg, model_cfg = load_model(self.cfg["model_path"], device=self.device)
-        log.info("ML model loaded from {}", self.cfg["model_path"])
-        self.scaler = joblib.load(self.cfg["scaler_path"])
-        log.info("Scaler loaded from {}", self.cfg["scaler_path"])
-
-        # dataset params
-        self.window_len  = dataset_cfg["window_len"]
-        self.look_ahead  = dataset_cfg["look_ahead"]
-        self.tp_prc      = dataset_cfg["tp_prc"]
-        self.sl_prc      = dataset_cfg["sl_prc"]
-        log.debug("Dataset cfg: window_len={}, look_ahead={}, tp_prc={}, sl_prc={}",
-                  self.window_len, self.look_ahead, self.tp_prc, self.sl_prc)
-
-        # thresholds & amounts
-        self.threshold_buy = self.cfg.get("threshold_buy")
-        self.threshold_sell = self.cfg.get("threshold_sell")
-        self.buy_amount   = self.cfg.get("buy_amount", 0.0001)
-        self.sell_prc  = self.cfg.get("sell_prc", 1.0)
-        log.info("Trading parameters: threshold_buy={}, threshold_sell={}, buy_amt={}, sell_prc={}",
-                 self.threshold_buy, self.threshold_sell, self.buy_amount, self.sell_prc)
-
-        # 3) Load tokens list
-        parsed_tokens = await self.db_reader.get_all(Token)
-        self.token_map = {t.pool_address: t.token_address for t in parsed_tokens}
-        log.info("Tokens loaded: {} pools", len(self.token_map))
-
-        # 2.3 External services
-        self.tg_notifier = TelegramNotifier(
-            token= BOT_TOKEN,
-            chat_id=self.cfg["tg_channel_id"],
-            message_queue=self.message_queue,
-            loop=self.loop,
-            poll_interval=1.0,
-        )       
-        log.info("TelegramNotifier initialized")
-
-        self.trader = RaydiumTrader(
-            rpc_url=RPC_URL,
-            secret_key_base58=PRIVATE_WALLET_KEY,
-            wallet_address=WALLET_ADDRESS,
-            confirm_level="finalized",
-        )
-        log.info("SolanaSwapService initialized (RPC={})", RPC_URL)
-
-        self.trans_proc = TransactionProcessor(
-            trader=self.trader,
-            db_writer=self.db_writer,
-            db_reader=self.db_reader,
-            message_queue=self.message_queue,
-            queue=self.trade_queue,
-        )
-        log.info("TransactionProcessor initialized")
-        self.sol_price_client = SolanaTokenPriceClient()
-
-        self.price_fetcher = PriceFetcher(
-            sol_price_client=self.sol_price_client,
-            db_writer=self.db_writer,
-            db_reader=self.db_reader,
-            num_workers=3,
-            retry_delay=2.0,
-            max_retries=5,
-            queue=self.price_queue,
-            tp_prc= self.tp_prc,
-            sl_prc= self.sl_prc,
-            trade_queue= self.trade_queue,
-            rate_limit_delay= 5
-        )
-        log.info("PriceFetcher initialized (workers={}, retries={})",
-                 self.price_fetcher.num_workers, self.price_fetcher.max_retries)
-
-        self.ohlcv_service = OHLCVService(
-            reader=self.db_reader,
-            writer=self.db_writer,
-            concurrency=5,
-            tokens_table=Token,
-        )
-        log.info("OHLCVService initialized (concurrency=5)")
-
-        self.free_api_fetcher = OHLCVFFREEAPI(
-            tokens=self.token_map,
-            save_path="free_api_data",
-            db_table= OHLCV_API,
-            db_writer=self.db_writer,
-            timeframe="hour",
-            aggregate=1,
-            limit=1000,
-            fetch_historical=True,
-            update_value=True,
-            SQLSession=self.SQLSession,
-        )
-        log.info("OHLCVFFREEAPI initialized (historical={})", self.free_api_fetcher.fetch_historical)
-
-        self.preproc = Preprocessor(
-            dataset_cfg=dataset_cfg,
-            table=OHLCV,
-            scaler=self.scaler,
-            prod=True,
-            SQLSession=self.SQLSession,
-            db_reader=self.db_reader
-        )
-        self.predictor = LSTMPredictor(
-            preproc = self.preproc,
-            db_reader=self.db_reader,
-            model_path=self.cfg["model_path"],
-            t_scaler_path=self.cfg.get("t_scaler_path", None),
-        )
-        self.preproc.tokens = self.token_map.keys()
-        log.info("Preprocessor initialized (prod mode)")
-
-        # Start all classes that require async start
-        self._writer_task = self.loop.create_task(self.db_writer.start())
-        log.info("DatabaseWriter worker started")
-
-        self._trade_task = self.loop.create_task(self.trans_proc.start())
-        log.info("TransactionProcessor worker task started")
-
-        await self.price_fetcher.start()
-        log.info("PriceFetcher workers started")
-
-        await self.tg_notifier.start()
-        log.info("TelegramNotifier polling started")
-
-        # 2.5 APScheduler
-        self.scheduler = AsyncIOScheduler(timezone="UTC", event_loop=self.loop)
-        self._register_jobs()
-        self.scheduler.start()
-        log.info("AsyncIOScheduler started with jobs: {}", list(self.scheduler.get_jobs()))
-
-        # 1) Fetch all historical OHLCV
-        self.free_api_fetcher.fetch_historical = False
-        # await self.free_api_fetcher.fetch_all() 
-        log.info("Historical OHLCV data fetched; switching to hourly mode")
-
-        # 2.6 Ready
-        self.buy_mode = self.cfg.get("buy_mode")
-        await self.message_queue.put("ℹ️ Trading bot initialised and running 🚀")
-        log.success("Setup completed successfully")
-
-
-    def _configure_logger(self) -> None:
-        # Берём путь из конфига (или по умолчанию ./logs) и оборачиваем в Path
-        log_dir = Path(self.cfg.get("log_path", "./logs"))
-        # Убедимся, что папка существует
-        log_dir.mkdir(parents=True, exist_ok=True)
-        setup_logging(log_dir, telegram_queue=self.message_queue)
-
-
-    async def shutdown(self) -> None:
-        """
-        Graceful shutdown: останавливаем scheduler, таски, закрываем сервисы.
-        """
-        logger.bind(component="TraidingBot").info("Shutting down TradingBot…")
-
-        # 1) Остановить APScheduler
-        self.scheduler.shutdown(wait=False)
-
-        # 2) Отменить таск обработки транзакций
-        if hasattr(self, "_trade_task"):
-            self._trade_task.cancel()
-            try:
-                await self._trade_task
-            except asyncio.CancelledError:
-                pass
-
-        # 4) Остановить PriceFetcher
-        await self.price_fetcher.stop()
-
-        # 5) Остановить TelegramNotifier
-        await self.tg_notifier.stop()
-
-        logger.bind(component="TraidingBot").success("Shutdown complete")
-
-
-    def _register_jobs(self) -> None:
-        """Создаём cron/interval-задачи согласно ТЗ."""
-        self.scheduler.add_job(
-            self.update_prices,
-            "interval",
-            seconds=120,
-            id="prices_2m",
-            max_instances=1,
-            misfire_grace_time=120,
-            args=[False],
-        )
-
-        self.scheduler.add_job(
-            self.update_prices,
-            "interval",
-            seconds=30,
-            id="holds_1m",
-            max_instances=1,
-            misfire_grace_time=30,
-            args=[True],
-        )
-
-        # создаём ежечасный джоб
-        self.scheduler.add_job(
-            self.build_ohlcv_and_predict,
-            trigger="cron",
-            minute=0,    
-            id="ohlcv_1h",
-            max_instances=1,
-            misfire_grace_time=300,
-            replace_existing=True
-        )
-        # дневные задачи
-        self.scheduler.add_job(
-            self.daily_tasks,
-            "cron",
-            hour=0,
-            id="daily",
-            max_instances=1,
-            misfire_grace_time=300
-        )
-
-        # недельная статистика
-        self.scheduler.add_job(
-            self.weekly_stats,
-            "cron",
-            day_of_week="mon",
-            hour=0,
-            id="weekly",
-            max_instances=1,
-            misfire_grace_time=300
-        )
-
-        self.scheduler.add_job(
-            self.free_api_fetcher.fetch_all,
-            "cron",
-            minute="0",
-            id="freeapi_hourly",
-            max_instances=1,
-            misfire_grace_time=300
-        )
-
-
-    async def update_prices(self, hold = False) -> None:
-        """
-        Задача APScheduler: каждые 60 секунд кидает все токены в очередь PriceFetcher
-        и ждёт обработки.
-        """
-        log = logger.bind(job="update_prices", component="TraidingBot")
-        log.info("Starting price update cycle")
+    async def start(self) -> None:
+        """Start all bot components."""
+        logger.info("=" * 60)
+        logger.info("BYBIT TRADING BOT STARTING")
+        logger.info("=" * 60)
 
         try:
-            if hold:
-                await self.price_fetcher.add_hold_tokens()
-            else:
-                await self.price_fetcher.add_other_tokens(self.token_map)
-            log.debug(f"Enqueued {len(self.token_map)} tasks")
+            # 1. Initialize database
+            await self._init_database()
 
-            # Ждём, когда очередь опустеет
-            await self.price_queue.join()
-            log.info("Price update cycle completed successfully")
+            # 2. Initialize Telegram notifier (if configured)
+            await self._init_telegram()
 
-        except Exception:
-            log.exception("Error during price update cycle")
+            # 3. Initialize Bybit client
+            await self._init_bybit_client()
 
+            # 4. Run initial token sync or load existing tokens
+            symbols = await self._init_tokens()
 
-    async def _compute_dynamic_buy_amount(self, prob = None) -> float:
-        """
-        Считает динамический депозит на токен:
-        (SOL_на_кошельке + сумма amount из HOLD) - резерв_на_комиссии) / max_tokens.
-        Если max_tokens не задан — возвращает текущий self.buy_amount из конфига.
-        """
-        log = logger.bind(component="TraidingBot", job="compute_buy_amount")
-        if self.buy_mode == "max_tokens":
-            # поддерживаем несколько возможных ключей из конфига
-            max_tokens = self.cfg.get("max_tokens_cnt", 0)
+            if not symbols:
+                logger.error("No symbols to trade. Check token sync configuration.")
+                await self._notify("No symbols to trade. Bot stopping.", notify_type="error")
+                return
 
-            if not max_tokens or max_tokens <= 0:
-                log.debug("max_tokens не задан, используем статический buy_amount={}", self.buy_amount)
-                return self.buy_amount
+            # 5. Seed historical candles for strategy bootstrap
+            await self._seed_historical_candles(symbols)
 
-            # 1) баланс SOL на кошельке
-            sol_balance = await self.trader.get_solana_balance()
+            # 6. Initialize pipeline components
+            await self._init_pipeline(symbols)
 
-            # 2) сумма amount по всем удержаниям (в SOL)
-            holds = await self.db_reader.get_all(Hold)
-            now_t_cnt = len(holds)
-            diff = max_tokens - now_t_cnt
-            fee_reserve = 0.03
-            if diff > 0:
-                available = sol_balance - fee_reserve
-                per_token = round(available / diff, 3)
-                log.info(
-                    "Dynamic buy calc ⇒ balanceSOL={:.6f}, available={:.6f}, diff={:.6f}, fee_reserve={:.6f}, "
-                    "max_tokens={}, buy_amount={:.6f}",
-                    sol_balance, available, diff, fee_reserve, max_tokens, per_token
-                )
-                return per_token
-        
-            else:
-                log.info(f"The maximum number of tokens has been reached: {now_t_cnt}.")
-                return self.buy_amount
-        
-        elif self.buy_mode == "correlation":
-            sol_per_trade = self.cfg.get("sol_per_trade", 1.0)
-            sol_balance = await self.trader.get_solana_balance()
-            avalible_sol = sol_balance - 0.05  # резерв на комиссии
-            per_pos_cap_max = self.cfg.get("max_alloc_per_pos", 0.1)
+            # 7. Start WebSocket streaming
+            await self._start_ws_streaming(symbols)
 
-            # Если прогноз ниже порога — не покупаем
-            if prob < self.threshold_buy or avalible_sol <= 0.0:
-                return 0.0
+            # 8. Start daily token sync scheduler
+            await self._start_token_sync_scheduler()
 
-            # Вес сигнала и целевая аллокация внутри [B, per_pos_cap_max]
-            denom = max(1e-9, 1.0 - self.threshold_buy)
-            w = (prob - self.threshold_buy) / denom
-            if w < 0.0: w = 0.0
-            if w > 1.0: w = 1.0
+            # 9. Start metrics reporter
+            await self._start_metrics_reporter()
 
-            cap_delta = max(0.0, float(per_pos_cap_max) - sol_per_trade)
-            target_sol = sol_per_trade + w * cap_delta
+            # Notify successful start
+            await self._notify(
+                f"Trading bot started\n"
+                f"Symbols: {len(symbols)}\n"
+                f"Max positions: {settings.max_positions}\n"
+                f"Risk per trade: {settings.risk_per_trade_pct}%",
+                notify_type="status"
+            )
 
-            # Финальная сумма ограничена доступным кэшем
-            alloc_sol = min(target_sol, avalible_sol)
+            logger.info("=" * 60)
+            logger.info("BOT RUNNING - Monitoring %d symbols", len(symbols))
+            logger.info("=" * 60)
 
-            # Любые микроскопические значения отсечём
-            return alloc_sol if alloc_sol > 1e-9 else 0.0
+            # Wait for shutdown signal
+            await self._stop_event.wait()
 
+        except Exception as e:
+            logger.critical("Fatal error during bot startup: {}", e)
+            await self._notify(f"Fatal startup error: {e}", notify_type="error")
+            raise
+        finally:
+            await self.stop()
 
-    async def build_ohlcv_and_predict(self) -> None:
-        log = logger.bind(job="build_ohlcv", component="TraidingBot")
-        log.info("Starting OHLCV build + predict")
-        try:
-            # 1) Построить OHLCV и загрузить данные
-            await self.ohlcv_service.run()
-            data_by_token = await self.preproc.load_all_data()
+    async def stop(self) -> None:
+        """Stop all bot components gracefully."""
+        logger.info("Shutting down trading bot...")
 
-            # 2) Получить список пулов из HOLD
-            holds = await self.db_reader.get_all(Hold)
-            hold_pools_raw = [h.pool_address for h in holds if getattr(h, "pool_address", None)]
+        self._stop_event.set()
 
-            # 3) Разделить на пулы из HOLD и остальные (из тех, по которым есть данные)
-            all_pools_with_data = list(data_by_token.keys())
-            hold_pools = [p for p in hold_pools_raw if p in data_by_token]
-            other_pools = [p for p in all_pools_with_data if p not in set(hold_pools)]
-
-            log.info("Prediction order ⇒ in HOLD: {}, others: {}", len(hold_pools), len(other_pools))
-
-            async def _process_one(pool_address: str) -> None:
-                df = data_by_token.get(pool_address)
-                if df is None:
-                    log.warning("No data for pool {}, skipping", pool_address)
-                    return
-                
-                if len(df) < self.preproc.window_len:
-                    log.warning("Not enough data for {}: {}/{}", pool_address, len(df), self.preproc.window_len)
-                    return
-
-                df_window = df.iloc[-self.preproc.window_len :]
-                # X = self.preproc.transform_window(df_window).unsqueeze(0).to(self.device)
-
-                prob = self.predictor.predict(df_window)
-
-                log.info("Model p for {}: {:.2f}", pool_address, prob)
-
-                # --- записываем лог предсказания в базу ---
-                token_addr = self.token_map.get(pool_address)
-                if not token_addr:
-                    log.warning(
-                        "token_address not found in token_map for pool {}, logging with token_address=None",
-                        pool_address
-                    )
-                timestamp = datetime.now(timezone.utc)
-                await self.db_writer.enqueue_insert(
-                    PredictLog,
-                    {
-                        "token_address": token_addr,
-                        "pool_address": pool_address,
-                        "time": timestamp,
-                        "prob": prob,
-                        "threshold": self.threshold_buy,
-                    }
-                )
-                log.debug(
-                    "Saved prediction for {} (token {}) at {}: prob={:.2f}, threshold_buy={:.2f}",
-                    pool_address, token_addr, timestamp, prob, self.threshold_buy
-                )
-
+        # Cancel tasks
+        for task in [self._ws_task, self._token_sync_scheduler_task, self._metrics_reporter_task]:
+            if task and not task.done():
+                task.cancel()
                 try:
-                    self.buy_amount = await self._compute_dynamic_buy_amount(prob)
-                    log.info(f"now buy_amount {self.buy_amount}")
+                    await asyncio.wait_for(task, timeout=5.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass
 
-                except Exception as e:
-                    log.exception(
-                        f"Не удалось посчитать динамический buy_amount — оставляем прежнее значение: {self.buy_amount}, ошибка: {e}",
-                    )
+        # Stop components in reverse order
+        if self._execution_engine:
+            await self._execution_engine.stop()
 
-                # использование актуального (возможно динамически пересчитанного) self.buy_amount
-                await decide_token(
-                    pool_address   = pool_address,
-                    prob           = prob,
-                    threshold_buy  = self.threshold_buy,
-                    threshold_sell = self.threshold_sell,
-                    buy_amount     = self.buy_amount,
-                    sell_prc       = self.sell_prc,
-                    db_reader      = self.db_reader,
-                    trade_queue    = self.trade_queue,
-                    token_map      = self.token_map,
-                )
+        if self._strategy_engine:
+            await self._strategy_engine.stop()
 
-            # 4) Сначала — токены из HOLD (по идее только Sell)
-            for pool in hold_pools:
-                await _process_one(pool)
-            
-            # 5) Затем — остальные токены (тут только Buy)
-            for pool in other_pools:
-                await _process_one(pool)
+        if self._candle_writer:
+            await self._candle_writer.stop()
 
-            log.success("OHLCV build + predict completed")
+        if self._token_sync_service:
+            await self._token_sync_service.stop()
 
-        except Exception:
-            log.exception("Error in build_ohlcv_and_predict")
+        if self._telegram_notifier:
+            await self._telegram_notifier.stop()
 
+        if self._bybit_client:
+            await self._bybit_client.close()
 
-    async def daily_tasks(self):
-        await daily_report(
-            logger=logger.bind(job="daily_report", component="TraidingBot"),
-            report_path=self.cfg.get("report_path", "./reports"),
-            log_path=self.cfg.get("log_path", "./logs"),
-            db_reader=self.db_reader,
-            threshold_buy=self.threshold_buy,
-            message_queue=self.message_queue
+        if self._db:
+            await self._db.close()
+
+        logger.info("Trading bot shutdown complete")
+        self._shutdown_complete.set()
+
+    # =========================================================================
+    # Initialization Methods
+    # =========================================================================
+
+    async def _init_database(self) -> None:
+        """Initialize database connection and tables."""
+        logger.info("Initializing database...")
+
+        self._db = Database(database_url=settings.database_url)
+        await self._db.create_tables()
+
+        self._repository = Repository(session_factory=self._db.session_factory)
+
+        logger.info("Database initialized")
+
+    async def _init_telegram(self) -> None:
+        """Initialize Telegram notifier if configured."""
+        if not settings.is_telegram_configured():
+            logger.info("Telegram notifications disabled (not configured)")
+            return
+
+        logger.info("Initializing Telegram notifier...")
+
+        self._telegram_notifier = TelegramNotifier(
+            token=settings.telegram_bot_token,
+            chat_id=settings.telegram_chat_id,
+            message_queue=self._telegram_queue,
+            poll_interval=settings.telegram_rate_limit_s,
+        )
+        await self._telegram_notifier.start()
+
+        logger.info("Telegram notifier started")
+
+    async def _init_bybit_client(self) -> None:
+        """Initialize Bybit API client."""
+        logger.info("Initializing Bybit client...")
+
+        self._bybit_client = BybitClient(
+            base_url=settings.bybit_rest_base_url,
+            ws_domain=settings.bybit_ws_domain,
+            timeout_s=settings.bybit_http_timeout_s,
+            max_retries=settings.bybit_http_max_retries,
+            testnet=settings.bybit_testnet,
         )
 
+        logger.info(
+            "Bybit client initialized (category=%s, testnet=%s)",
+            settings.bybit_category,
+            settings.bybit_testnet
+        )
 
-    async def weekly_stats(self) -> None: ...
+    async def _init_tokens(self) -> List[str]:
+        """
+        Initialize token list.
+
+        Either loads existing tokens from DB or runs initial sync.
+        """
+        assert self._repository is not None
+        assert self._db is not None
+
+        # Check existing tokens
+        tokens = await self._repository.get_all(
+            Token,
+            filters={"is_active": True},
+            limit=settings.max_symbols if settings.max_symbols > 0 else None
+        )
+
+        if tokens:
+            logger.info("Loaded %d active tokens from database", len(tokens))
+            # Filter by current category
+            category = settings.bybit_category.lower()
+            symbols = [
+                t.bybit_symbol for t in tokens
+                if t.bybit_categories and category in t.bybit_categories.lower()
+            ]
+            logger.info("Filtered to %d symbols for category '%s'", len(symbols), category)
+            return symbols
+
+        # No tokens - run initial sync
+        logger.info("No tokens in database, running initial sync...")
+
+        self._token_sync_service = TokenSyncService(
+            repository=self._repository,
+            market_cap_threshold_usd=settings.min_market_cap_usd,
+            bybit_categories=settings.token_sync_categories_list,
+            symbol_aliases=settings.symbol_aliases_dict,
+            sync_interval_hours=24,  # Will be managed by scheduler
+        )
+
+        count = await self._token_sync_service.sync_now()
+        logger.info("Initial token sync completed: %d tokens", count)
+
+        await self._notify(f"Token sync: {count} tokens loaded", notify_type="sync")
+
+        # Reload tokens
+        tokens = await self._repository.get_all(
+            Token,
+            filters={"is_active": True},
+            limit=settings.max_symbols if settings.max_symbols > 0 else None
+        )
+
+        category = settings.bybit_category.lower()
+        symbols = [
+            t.bybit_symbol for t in tokens
+            if t.bybit_categories and category in t.bybit_categories.lower()
+        ]
+
+        return symbols
+
+    async def _seed_historical_candles(self, symbols: List[str]) -> None:
+        """Seed historical candle data for strategy bootstrap."""
+        assert self._bybit_client is not None
+        assert self._db is not None
+
+        logger.info(
+            "Seeding %d days of historical candles for %d symbols...",
+            settings.seed_days,
+            len(symbols)
+        )
+
+        try:
+            await self._bybit_client.seed_1m_history_to_db(
+                category=settings.bybit_category,
+                symbols=symbols,
+                session_factory=self._db.session_factory,
+                candle_model=Candle1m,
+                days=settings.seed_days,
+                concurrency=settings.seed_concurrency,
+            )
+            logger.info("Historical candle seeding complete")
+        except Exception as e:
+            logger.error("Error seeding historical candles: {}", e)
+            # Continue anyway - strategy will work with available data
+
+    async def _init_pipeline(self, symbols: List[str]) -> None:
+        """Initialize the trading pipeline components."""
+        assert self._db is not None
+
+        logger.info("Initializing trading pipeline...")
+
+        # Candle writer service
+        self._candle_writer = CandleWriterService(
+            input_queue=self._db_write_queue,
+            session_factory=self._db.session_factory,
+            candle_model=Candle1m,
+            flush_interval_s=settings.flush_interval_s,
+            retention_days=settings.keep_days,
+            cleanup_interval_minutes=settings.candle_cleanup_interval_minutes,
+            metrics=self._metrics,
+        )
+        await self._candle_writer.start()
+
+        # Strategy engine
+        self._strategy_engine = StrategyEngine(
+            marketdata_queue=self._marketdata_queue,
+            db_write_queue=self._db_write_queue,
+            signal_queue=self._signal_queue,
+            volume_window_minutes=settings.volume_window_minutes,
+            ma_period=settings.ma_exit_period,
+            price_acceleration_factor=settings.price_acceleration_factor,
+            metrics=self._metrics,
+        )
+
+        # Load historical data for strategy state
+        for symbol in symbols[:50]:  # Bootstrap first 50 symbols
+            try:
+                candles = await self._candle_writer.get_recent_candles(symbol, limit=7200)
+                if candles:
+                    self._strategy_engine.load_historical_data(symbol, candles)
+            except Exception as e:
+                logger.debug("Failed to load history for {}: {}", symbol, e)
+
+        await self._strategy_engine.start()
+
+        # Execution engine with trading decision logging
+        self._execution_engine = ExecutionEngine(
+            signal_queue=self._signal_queue,
+            session_factory=self._db.session_factory,
+            position_model=Position,
+            order_model=Order,
+            signal_model=Signal,
+            strategy_engine=self._strategy_engine,
+            max_positions=settings.max_positions,
+            risk_per_trade_pct=settings.risk_per_trade_pct,
+            min_trade_usdt=settings.min_trade_amount_usdt,
+            metrics=self._metrics,
+        )
+
+        # Wrap execution engine to add trading logs and notifications
+        original_handle_entry = self._execution_engine._handle_entry
+        original_handle_exit = self._execution_engine._handle_exit
+
+        async def logged_handle_entry(signal: TradingSignal) -> None:
+            """Wrapper to log entry decisions."""
+            self._trading_log.info(
+                "ENTRY SIGNAL: {} @ {:.6f} | volume_ratio={:.2f} | price_change={:.2f}%",
+                signal.symbol,
+                signal.price,
+                signal.volume_ratio or 0,
+                signal.price_change_pct or 0,
+            )
+
+            await original_handle_entry(signal)
+
+            # Check if position was opened
+            if signal.symbol in self._execution_engine._open_positions:
+                msg = (
+                    f"BUY {signal.symbol}\n"
+                    f"Price: {signal.price:.6f}\n"
+                    f"Volume ratio: {signal.volume_ratio:.2f}x\n"
+                    f"Price change: {signal.price_change_pct:.2f}%"
+                )
+                self._trading_log.info("ENTRY EXECUTED: {}", msg.replace('\n', ' | '))
+                await self._notify(msg, notify_type="trade")
+
+        async def logged_handle_exit(signal: TradingSignal) -> None:
+            """Wrapper to log exit decisions."""
+            self._trading_log.info(
+                "EXIT SIGNAL: {} @ {:.6f} | ma14={:.6f}",
+                signal.symbol,
+                signal.price,
+                signal.ma14_value or 0,
+            )
+
+            # Get position info before exit
+            position_id = self._execution_engine._open_positions.get(signal.symbol)
+            position = None
+            if position_id:
+                position = await self._execution_engine._get_position(position_id)
+
+            await original_handle_exit(signal)
+
+            # Check if position was closed
+            if signal.symbol not in self._execution_engine._open_positions and position:
+                exit_value = position.entry_amount * signal.price
+                profit_usdt = exit_value - position.entry_value_usdt
+                profit_pct = (profit_usdt / position.entry_value_usdt) * 100
+
+                emoji = "+" if profit_usdt >= 0 else ""
+                msg = (
+                    f"SELL {signal.symbol}\n"
+                    f"Exit price: {signal.price:.6f}\n"
+                    f"Entry price: {position.entry_price:.6f}\n"
+                    f"P&L: {emoji}{profit_usdt:.2f} USDT ({emoji}{profit_pct:.2f}%)"
+                )
+                self._trading_log.info("EXIT EXECUTED: {}", msg.replace('\n', ' | '))
+                await self._notify(msg, notify_type="trade")
+
+        self._execution_engine._handle_entry = logged_handle_entry
+        self._execution_engine._handle_exit = logged_handle_exit
+
+        await self._execution_engine.start()
+
+        logger.info("Trading pipeline initialized")
+
+    async def _start_ws_streaming(self, symbols: List[str]) -> None:
+        """Start WebSocket streaming for market data."""
+        assert self._bybit_client is not None
+
+        logger.info("Starting WebSocket market data stream...")
+
+        self._ws_task = asyncio.create_task(
+            self._bybit_client.stream_klines_to_queue(
+                category=settings.bybit_category,
+                symbols=symbols,
+                output_queue=self._marketdata_queue,
+                ping_interval_s=settings.bybit_ws_ping_interval_s,
+                metrics=self._metrics,
+                stop_event=self._stop_event,
+            ),
+            name="ws-kline-stream"
+        )
+
+        logger.info("WebSocket stream started for %d symbols", len(symbols))
+
+    async def _start_token_sync_scheduler(self) -> None:
+        """Start daily token sync scheduler at configured time."""
+        self._token_sync_scheduler_task = asyncio.create_task(
+            self._token_sync_scheduler_loop(),
+            name="token-sync-scheduler"
+        )
+        logger.info(
+            "Token sync scheduler started (daily at %s %s)",
+            settings.token_sync_time,
+            settings.timezone
+        )
+
+    async def _token_sync_scheduler_loop(self) -> None:
+        """Run token sync daily at configured time."""
+        tz = pytz.timezone(settings.timezone)
+        target_time = datetime.strptime(settings.token_sync_time, "%H:%M").time()
+
+        while not self._stop_event.is_set():
+            try:
+                now = datetime.now(tz)
+
+                # Calculate next run time
+                target_dt = datetime.combine(now.date(), target_time)
+                target_dt = tz.localize(target_dt)
+
+                if target_dt <= now:
+                    # Already passed today, schedule for tomorrow
+                    target_dt += timedelta(days=1)
+
+                wait_seconds = (target_dt - now).total_seconds()
+                logger.debug("Next token sync in {:.1f} hours", wait_seconds / 3600)
+
+                # Wait until target time
+                try:
+                    await asyncio.wait_for(
+                        self._stop_event.wait(),
+                        timeout=wait_seconds
+                    )
+                    # Stop event was set
+                    break
+                except asyncio.TimeoutError:
+                    # Time to sync
+                    pass
+
+                # Run sync
+                logger.info("Starting scheduled token sync...")
+
+                if self._token_sync_service and self._repository:
+                    try:
+                        count = await self._token_sync_service.sync_now()
+                        logger.info("Scheduled token sync completed: %d tokens", count)
+                        await self._notify(f"Token sync: {count} tokens synced", notify_type="sync")
+
+                    except Exception as e:
+                        logger.error("Token sync failed: {}", e)
+                        await self._notify(f"Token sync failed: {e}", notify_type="error")
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.exception("Error in token sync scheduler: {}", e)
+                await asyncio.sleep(60)  # Wait before retry
+
+    async def _start_metrics_reporter(self) -> None:
+        """Start periodic metrics reporter."""
+        self._metrics_reporter_task = asyncio.create_task(
+            self._metrics_reporter_loop(),
+            name="metrics-reporter"
+        )
+
+    async def _metrics_reporter_loop(self) -> None:
+        """Report metrics every 5 minutes."""
+        while not self._stop_event.is_set():
+            try:
+                await asyncio.sleep(300)  # 5 minutes
+
+                snapshot = self._metrics.snapshot()
+                logger.info(
+                    "Pipeline metrics | ws_msgs=%d | candles=%d | db_writes=%d | "
+                    "signals=%d | executed=%d | errors=%d",
+                    snapshot["ws_messages_received"],
+                    snapshot["candle_updates_processed"],
+                    snapshot["db_writes_completed"],
+                    snapshot["signals_generated"],
+                    snapshot["signals_executed"],
+                    snapshot["errors"],
+                )
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("Error in metrics reporter: {}", e)
+
+    # =========================================================================
+    # Notification Helper
+    # =========================================================================
+
+    async def _notify(self, message: str, notify_type: str = "status") -> None:
+        """
+        Send notification if enabled for the given type.
+
+        Args:
+            message: Notification text
+            notify_type: One of: trade, signal, error, sync, status
+        """
+        if not settings.is_telegram_configured():
+            return
+
+        if notify_type not in settings.telegram_notify_types_set:
+            return
+
+        try:
+            self._telegram_queue.put_nowait({"text": message, "parse_mode": "HTML"})
+        except asyncio.QueueFull:
+            logger.warning("Telegram queue full, dropping notification")
 
 
-async def main(config):
-    bot = TraidingBot(config)
-    await bot.setup()
+def signal_handler(bot: TradingBot) -> None:
+    """Create signal handler for graceful shutdown."""
+    def handler(sig, frame):
+        logger.info("Received signal %s, initiating shutdown...", sig)
+        asyncio.get_event_loop().call_soon_threadsafe(bot._stop_event.set)
+    return handler
 
-    # блокируемся «навсегда»
-    await asyncio.Event().wait()
+
+async def main() -> None:
+    """Main entry point."""
+    # Setup logging with Telegram integration
+    telegram_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=500)
+    setup_logging(settings.log_dir, telegram_queue=telegram_queue)
+
+    logger.info("Starting Bybit Trading Bot...")
+    logger.info("Config: category=%s, testnet=%s", settings.bybit_category, settings.bybit_testnet)
+
+    # Create bot instance
+    bot = TradingBot()
+
+    # The telegram queue from logging goes to the same notifier
+    # (setup_logging uses it for CRITICAL logs)
+
+    # Setup signal handlers
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, signal_handler(bot))
+
+    # Run bot
+    await bot.start()
 
 
 if __name__ == "__main__":
-    asyncio.run(main(config))
+    try:
+        asyncio.run(main())
+
+    except KeyboardInterrupt:
+        logger.info("Bot interrupted by user")
+
+    except Exception as e:
+        logger.critical("Unhandled exception: {}", e)
+        sys.exit(1)
