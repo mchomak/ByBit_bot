@@ -548,8 +548,8 @@ class TradingBot:
 
                 snapshot = self._metrics.snapshot()
                 logger.info(
-                    "Pipeline metrics | ws_msgs=%d | candles=%d | db_writes=%d | "
-                    "signals=%d | executed=%d | errors=%d",
+                    "Pipeline metrics | ws_msgs={} | candles={} | db_writes={} | "
+                    "signals={} | executed={} | errors={}",
                     snapshot["ws_messages_received"],
                     snapshot["candle_updates_processed"],
                     snapshot["db_writes_completed"],

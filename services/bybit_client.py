@@ -411,39 +411,53 @@ class BybitClient:
         candle_model: Any,
         days: int = 5,
         concurrency: int = 8,
+        batch_size: int = 3000,
     ) -> None:
         """
         Backfill candles for multiple symbols (REST) and write to PostgreSQL.
 
-        Uses one transaction per symbol with ON CONFLICT DO UPDATE.
+        Uses batched inserts to avoid exceeding PostgreSQL's 32767 parameter limit.
+        With 9 columns per row, max safe batch is ~3600 rows.
         """
         sem = asyncio.Semaphore(max(1, int(concurrency)))
 
+        async def _insert_batch(session, batch: List[Dict[str, Any]]) -> None:
+            """Insert a batch of rows with ON CONFLICT DO UPDATE."""
+            if not batch:
+                return
+            stmt = pg_insert(candle_model).values(batch)
+            update_cols = {
+                "open": stmt.excluded.open,
+                "high": stmt.excluded.high,
+                "low": stmt.excluded.low,
+                "close": stmt.excluded.close,
+                "volume": stmt.excluded.volume,
+                "turnover": stmt.excluded.turnover,
+                "is_confirmed": stmt.excluded.is_confirmed,
+            }
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["symbol", "timestamp"],
+                set_=update_cols,
+            )
+            await session.execute(stmt)
+
         async def _one(sym: str) -> None:
             async with sem:
-                rows = await self.fetch_1m_history(category=category, symbol=sym, days=days)
-                if not rows:
-                    return
+                try:
+                    rows = await self.fetch_1m_history(category=category, symbol=sym, days=days)
+                    if not rows:
+                        return
 
-                async with session_factory() as session:
-                    stmt = pg_insert(candle_model).values(rows)
-                    update_cols = {
-                        "open": stmt.excluded.open,
-                        "high": stmt.excluded.high,
-                        "low": stmt.excluded.low,
-                        "close": stmt.excluded.close,
-                        "volume": stmt.excluded.volume,
-                        "turnover": stmt.excluded.turnover,
-                        "is_confirmed": stmt.excluded.is_confirmed,
-                    }
-                    stmt = stmt.on_conflict_do_update(
-                        index_elements=["symbol", "timestamp"],
-                        set_=update_cols,
-                    )
-                    await session.execute(stmt)
-                    await session.commit()
+                    # Insert in batches to avoid parameter limit
+                    async with session_factory() as session:
+                        for i in range(0, len(rows), batch_size):
+                            batch = rows[i:i + batch_size]
+                            await _insert_batch(session, batch)
+                        await session.commit()
 
-                self._log.info("Seeded %s: %d rows", sym, len(rows))
+                    self._log.info("Seeded %s: %d rows", sym, len(rows))
+                except Exception as e:
+                    self._log.warning("Failed to seed %s: %s", sym, e)
 
         await asyncio.gather(*[_one(s) for s in symbols])
 
