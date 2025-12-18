@@ -363,6 +363,7 @@ class TradingBot:
                 candles = await self._candle_writer.get_recent_candles(symbol, limit=7200)
                 if candles:
                     self._strategy_engine.load_historical_data(symbol, candles)
+                    
             except Exception as e:
                 logger.debug("Failed to load history for {}: {}", symbol, e)
 
