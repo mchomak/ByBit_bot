@@ -159,10 +159,15 @@ def test_instrument_info(symbol: str = "BTCUSDT"):
         
         print("✅ Информация получена!")
         print(f"   Статус: {data.get('status')}")
-        print(f"   Мин. количество: {lot_filter.get('minOrderQty')}")
-        print(f"   Макс. количество: {lot_filter.get('maxOrderQty')}")
-        print(f"   Шаг количества: {lot_filter.get('basePrecision')}")
-        print(f"   Шаг цены: {price_filter.get('tickSize')}")
+        print(f"\n   📊 ЛИМИТЫ КОЛИЧЕСТВА:")
+        print(f"      Мин. количество: {lot_filter.get('minOrderQty')}")
+        print(f"      Макс. количество: {lot_filter.get('maxOrderQty')}")
+        print(f"      Шаг количества: {lot_filter.get('basePrecision')}")
+        print(f"\n   💰 ЛИМИТЫ СТОИМОСТИ:")
+        print(f"      ⚠️  Мин. стоимость ордера: ${lot_filter.get('minOrderAmt')} USDT")
+        print(f"      Макс. стоимость ордера: ${lot_filter.get('maxOrderAmt')} USDT")
+        print(f"\n   💲 ЛИМИТЫ ЦЕНЫ:")
+        print(f"      Шаг цены: {price_filter.get('tickSize')}")
     else:
         print(f"❌ Ошибка: {result.get('retMsg')}")
     
@@ -194,22 +199,38 @@ def test_market_buy(symbol: str = "BTCUSDT", qty: str = "0.001", in_usdt: bool =
     price = client.get_current_price(symbol, Category.SPOT)
     print(f"   Текущая цена: ${price:,.2f}" if price else "   Цена недоступна")
     
-    # Если сумма в USDT, рассчитываем количество токенов
-    if in_usdt and price:
-        usdt_amount = float(qty)
-        calculated_qty = client.calculate_qty_from_usdt(symbol, usdt_amount, Category.SPOT)
-        if calculated_qty:
-            print(f"   💰 ${usdt_amount} USDT = {calculated_qty} {symbol.replace('USDT', '')}")
-            qty = calculated_qty
-        else:
-            print("   ❌ Не удалось рассчитать количество")
-            return None
+    # Показываем минимальный ордер (полная информация)
+    min_info = client.get_min_order_info(symbol, Category.SPOT)
+    min_qty = min_info.get("min_qty")
+    min_amt = min_info.get("min_amt")
     
-    # Показываем минимальный ордер
-    min_qty = client.get_min_order_qty(symbol, Category.SPOT)
-    if min_qty:
-        min_value = float(min_qty) * price if price else 0
-        print(f"   📊 Минимальный ордер: {min_qty} (~${min_value:.2f})")
+    print(f"\n   📊 ЛИМИТЫ ОРДЕРА:")
+    if min_qty and price:
+        min_qty_value = float(min_qty) * price
+        print(f"      Мин. количество: {min_qty} (~${min_qty_value:.2f})")
+    if min_amt:
+        print(f"      ⚠️  Мин. стоимость: ${float(min_amt):.2f} USDT")
+    
+    # Если сумма в USDT
+    if in_usdt:
+        usdt_amount = float(qty)
+        
+        # Проверяем минимум
+        if min_amt and usdt_amount < float(min_amt):
+            print(f"\n   ❌ ОШИБКА: Сумма ${usdt_amount} меньше минимума ${min_amt}!")
+            return None
+        
+        # Показываем примерное количество токенов
+        if price:
+            approx_qty = usdt_amount / price
+            print(f"\n   💰 ${usdt_amount} USDT ≈ {approx_qty:.6f} {symbol.replace('USDT', '')}")
+        
+        print(f"   📤 Отправляем ордер на покупку за ${qty} USDT (marketUnit=quoteCoin)")
+    else:
+        # Показываем стоимость
+        if price:
+            order_value = float(qty) * price
+            print(f"\n   💰 {qty} {symbol.replace('USDT', '')} ≈ ${order_value:.2f}")
     
     # Подтверждение
     confirm = input("\n   ⚠️  Создать ордер? (yes/no): ")
@@ -217,7 +238,8 @@ def test_market_buy(symbol: str = "BTCUSDT", qty: str = "0.001", in_usdt: bool =
         print("   Отменено")
         return None
     
-    result = client.market_buy(symbol, qty, Category.SPOT)
+    # Вызываем market_buy с правильными параметрами
+    result = client.market_buy(symbol, qty, Category.SPOT, in_quote_coin=in_usdt)
     print(format_order_result(result))
     
     return result
@@ -244,22 +266,38 @@ def test_market_sell(symbol: str = "BTCUSDT", qty: str = "0.001", in_usdt: bool 
     price = client.get_current_price(symbol, Category.SPOT)
     print(f"   Текущая цена: ${price:,.2f}" if price else "   Цена недоступна")
     
-    # Если сумма в USDT, рассчитываем количество токенов
-    if in_usdt and price:
-        usdt_amount = float(qty)
-        calculated_qty = client.calculate_qty_from_usdt(symbol, usdt_amount, Category.SPOT)
-        if calculated_qty:
-            print(f"   💰 ${usdt_amount} USDT = {calculated_qty} {symbol.replace('USDT', '')}")
-            qty = calculated_qty
-        else:
-            print("   ❌ Не удалось рассчитать количество")
-            return None
+    # Показываем минимальный ордер (полная информация)
+    min_info = client.get_min_order_info(symbol, Category.SPOT)
+    min_qty = min_info.get("min_qty")
+    min_amt = min_info.get("min_amt")
     
-    # Показываем минимальный ордер
-    min_qty = client.get_min_order_qty(symbol, Category.SPOT)
-    if min_qty:
-        min_value = float(min_qty) * price if price else 0
-        print(f"   📊 Минимальный ордер: {min_qty} (~${min_value:.2f})")
+    print(f"\n   📊 ЛИМИТЫ ОРДЕРА:")
+    if min_qty and price:
+        min_qty_value = float(min_qty) * price
+        print(f"      Мин. количество: {min_qty} (~${min_qty_value:.2f})")
+    if min_amt:
+        print(f"      ⚠️  Мин. стоимость: ${float(min_amt):.2f} USDT")
+    
+    # Если сумма в USDT
+    if in_usdt:
+        usdt_amount = float(qty)
+        
+        # Проверяем минимум
+        if min_amt and usdt_amount < float(min_amt):
+            print(f"\n   ❌ ОШИБКА: Сумма ${usdt_amount} меньше минимума ${min_amt}!")
+            return None
+        
+        # Показываем примерное количество токенов
+        if price:
+            approx_qty = usdt_amount / price
+            print(f"\n   💰 ${usdt_amount} USDT ≈ {approx_qty:.6f} {symbol.replace('USDT', '')}")
+        
+        print(f"   📤 Отправляем ордер на продажу на ${qty} USDT (marketUnit=quoteCoin)")
+    else:
+        # Показываем стоимость
+        if price:
+            order_value = float(qty) * price
+            print(f"\n   💰 {qty} {symbol.replace('USDT', '')} ≈ ${order_value:.2f}")
     
     # Подтверждение
     confirm = input("\n   ⚠️  Создать ордер? (yes/no): ")
@@ -267,7 +305,8 @@ def test_market_sell(symbol: str = "BTCUSDT", qty: str = "0.001", in_usdt: bool 
         print("   Отменено")
         return None
     
-    result = client.market_sell(symbol, qty, Category.SPOT)
+    # Вызываем market_sell с правильными параметрами
+    result = client.market_sell(symbol, qty, Category.SPOT, in_quote_coin=in_usdt)
     print(format_order_result(result))
     
     return result
@@ -289,15 +328,26 @@ def test_limit_buy(symbol: str = "BTCUSDT", qty: str = "0.001", price: str = "50
     current_price = client.get_current_price(symbol, Category.SPOT)
     print(f"   Текущая цена: ${current_price:,.2f}" if current_price else "   Цена недоступна")
     
-    # Показываем минимальный ордер
-    min_qty = client.get_min_order_qty(symbol, Category.SPOT)
+    # Показываем минимальный ордер (полная информация)
+    min_info = client.get_min_order_info(symbol, Category.SPOT)
+    min_qty = min_info.get("min_qty")
+    min_amt = min_info.get("min_amt")
+    
+    print(f"\n   📊 ЛИМИТЫ ОРДЕРА:")
     if min_qty and current_price:
-        min_value = float(min_qty) * current_price
-        print(f"   📊 Минимальный ордер: {min_qty} (~${min_value:.2f})")
+        min_qty_value = float(min_qty) * current_price
+        print(f"      Мин. количество: {min_qty} (~${min_qty_value:.2f})")
+    if min_amt:
+        print(f"      ⚠️  Мин. стоимость: ${float(min_amt):.2f} USDT")
     
     # Показываем стоимость ордера
     order_value = float(qty) * float(price)
-    print(f"   💵 Стоимость ордера: ${order_value:,.2f}")
+    print(f"\n   💵 Стоимость твоего ордера: ${order_value:,.2f}")
+    
+    # Проверка минимума
+    if min_amt and order_value < float(min_amt):
+        print(f"   ❌ ОШИБКА: Стоимость ${order_value:.2f} меньше минимума ${min_amt}!")
+        return None
     
     # Подтверждение
     confirm = input("\n   ⚠️  Создать ордер? (yes/no): ")
@@ -327,15 +377,26 @@ def test_limit_sell(symbol: str = "BTCUSDT", qty: str = "0.001", price: str = "1
     current_price = client.get_current_price(symbol, Category.SPOT)
     print(f"   Текущая цена: ${current_price:,.2f}" if current_price else "   Цена недоступна")
     
-    # Показываем минимальный ордер
-    min_qty = client.get_min_order_qty(symbol, Category.SPOT)
+    # Показываем минимальный ордер (полная информация)
+    min_info = client.get_min_order_info(symbol, Category.SPOT)
+    min_qty = min_info.get("min_qty")
+    min_amt = min_info.get("min_amt")
+    
+    print(f"\n   📊 ЛИМИТЫ ОРДЕРА:")
     if min_qty and current_price:
-        min_value = float(min_qty) * current_price
-        print(f"   📊 Минимальный ордер: {min_qty} (~${min_value:.2f})")
+        min_qty_value = float(min_qty) * current_price
+        print(f"      Мин. количество: {min_qty} (~${min_qty_value:.2f})")
+    if min_amt:
+        print(f"      ⚠️  Мин. стоимость: ${float(min_amt):.2f} USDT")
     
     # Показываем стоимость ордера
     order_value = float(qty) * float(price)
-    print(f"   💵 Стоимость ордера: ${order_value:,.2f}")
+    print(f"\n   💵 Стоимость твоего ордера: ${order_value:,.2f}")
+    
+    # Проверка минимума
+    if min_amt and order_value < float(min_amt):
+        print(f"   ❌ ОШИБКА: Стоимость ${order_value:.2f} меньше минимума ${min_amt}!")
+        return None
     
     # Подтверждение
     confirm = input("\n   ⚠️  Создать ордер? (yes/no): ")

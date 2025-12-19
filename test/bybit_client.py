@@ -237,7 +237,8 @@ class BybitClient:
         time_in_force: TimeInForce = TimeInForce.GTC,
         reduce_only: bool = False,
         close_on_trigger: bool = False,
-        order_link_id: Optional[str] = None
+        order_link_id: Optional[str] = None,
+        market_unit: Optional[str] = None
     ) -> OrderResult:
         """
         Разместить ордер
@@ -253,6 +254,9 @@ class BybitClient:
             reduce_only: Только уменьшение позиции
             close_on_trigger: Закрыть при срабатывании
             order_link_id: Пользовательский ID ордера
+            market_unit: Единица измерения для market ордеров на споте:
+                         "baseCoin" - qty в базовой монете (BTC)
+                         "quoteCoin" - qty в котировочной монете (USDT)
             
         Returns:
             OrderResult с результатом операции
@@ -268,6 +272,10 @@ class BybitClient:
         
         if price and order_type == OrderType.LIMIT:
             params["price"] = price
+        
+        # Для спотовых рыночных ордеров добавляем marketUnit
+        if category == Category.SPOT and order_type == OrderType.MARKET and market_unit:
+            params["marketUnit"] = market_unit
         
         if category != Category.SPOT:
             params["reduceOnly"] = reduce_only
@@ -302,46 +310,54 @@ class BybitClient:
         self,
         symbol: str,
         qty: str,
-        category: Category = Category.SPOT
+        category: Category = Category.SPOT,
+        in_quote_coin: bool = False
     ) -> OrderResult:
         """
         Рыночная покупка
         
         Args:
             symbol: Торговая пара
-            qty: Количество
+            qty: Количество (в базовой монете или в USDT если in_quote_coin=True)
             category: Категория
+            in_quote_coin: Если True, qty - это сумма в USDT
         """
+        market_unit = "quoteCoin" if in_quote_coin else "baseCoin"
         return self.place_order(
             category=category,
             symbol=symbol,
             side=OrderSide.BUY,
             order_type=OrderType.MARKET,
             qty=qty,
-            time_in_force=TimeInForce.IOC
+            time_in_force=TimeInForce.IOC,
+            market_unit=market_unit if category == Category.SPOT else None
         )
     
     def market_sell(
         self,
         symbol: str,
         qty: str,
-        category: Category = Category.SPOT
+        category: Category = Category.SPOT,
+        in_quote_coin: bool = False
     ) -> OrderResult:
         """
         Рыночная продажа
         
         Args:
             symbol: Торговая пара
-            qty: Количество
+            qty: Количество (в базовой монете или в USDT если in_quote_coin=True)
             category: Категория
+            in_quote_coin: Если True, qty - это сумма в USDT
         """
+        market_unit = "quoteCoin" if in_quote_coin else "baseCoin"
         return self.place_order(
             category=category,
             symbol=symbol,
             side=OrderSide.SELL,
             order_type=OrderType.MARKET,
             qty=qty,
-            time_in_force=TimeInForce.IOC
+            time_in_force=TimeInForce.IOC,
+            market_unit=market_unit if category == Category.SPOT else None
         )
     
     def limit_buy(
@@ -550,6 +566,29 @@ class BybitClient:
                 lot_filter = result[0].get("lotSizeFilter", {})
                 return lot_filter.get("minOrderQty")
         return None
+    
+    def get_min_order_info(self, symbol: str, category: Category = Category.SPOT) -> Dict[str, Optional[str]]:
+        """
+        Получить полную информацию о минимальном ордере
+        
+        Returns:
+            Dict с ключами:
+            - min_qty: минимальное количество токенов
+            - min_amt: минимальная сумма в USDT
+            - base_precision: шаг количества
+        """
+        info = self.get_instruments_info(category, symbol)
+        if info.get("retCode") == 0:
+            result = info.get("result", {}).get("list", [])
+            if result:
+                lot_filter = result[0].get("lotSizeFilter", {})
+                return {
+                    "min_qty": lot_filter.get("minOrderQty"),
+                    "min_amt": lot_filter.get("minOrderAmt"),  # Минимум в USDT!
+                    "base_precision": lot_filter.get("basePrecision"),
+                    "quote_precision": lot_filter.get("quotePrecision")
+                }
+        return {"min_qty": None, "min_amt": None, "base_precision": None, "quote_precision": None}
     
     def calculate_qty_from_usdt(
         self,
