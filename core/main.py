@@ -45,6 +45,7 @@ from services.pipeline_events import PipelineMetrics, CandleUpdate, TradingSigna
 from services.strategy_engine import StrategyEngine
 from services.execution_engine import ExecutionEngine
 from services.token_sync_service import TokenSyncService
+from services.order_executor import OrderExecutorService, OrderRequest, OrderSide, OrderType
 
 
 class TradingBot:
@@ -69,6 +70,7 @@ class TradingBot:
         self._marketdata_queue: asyncio.Queue[CandleUpdate] = asyncio.Queue(maxsize=10000)
         self._db_write_queue: asyncio.Queue = asyncio.Queue(maxsize=50000)
         self._signal_queue: asyncio.Queue[TradingSignal] = asyncio.Queue(maxsize=1000)
+        self._order_queue: asyncio.Queue[OrderRequest] = asyncio.Queue(maxsize=500)
         self._telegram_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=500)
 
         # Shared metrics
@@ -81,6 +83,7 @@ class TradingBot:
         self._candle_writer: Optional[CandleWriterService] = None
         self._strategy_engine: Optional[StrategyEngine] = None
         self._execution_engine: Optional[ExecutionEngine] = None
+        self._order_executor: Optional[OrderExecutorService] = None
         self._token_sync_service: Optional[TokenSyncService] = None
         self._telegram_notifier: Optional[TelegramNotifier] = None
 
@@ -170,6 +173,9 @@ class TradingBot:
                     pass
 
         # Stop components in reverse order
+        if self._order_executor:
+            await self._order_executor.stop()
+
         if self._execution_engine:
             await self._execution_engine.stop()
 
@@ -304,26 +310,65 @@ class TradingBot:
         return symbols
 
     async def _seed_historical_candles(self, symbols: List[str]) -> None:
-        """Seed historical candle data for strategy bootstrap."""
+        """
+        Check and seed historical candle data for strategy bootstrap.
+
+        For each symbol, checks if we have 5 days of candle data.
+        Only backfills symbols that have insufficient data.
+        """
         assert self._bybit_client is not None
         assert self._db is not None
 
+        logger.info("Checking candle history for %d symbols...", len(symbols))
+
+        # Check which symbols need backfill
+        symbols_to_backfill = []
+        required_candles = settings.seed_days * 24 * 60  # 5 days of minute candles
+
+        async with self._db.session_factory() as session:
+            from sqlalchemy import func, select
+
+            for symbol in symbols:
+                try:
+                    # Count confirmed candles for this symbol
+                    stmt = select(func.count(Candle1m.id)).where(
+                        Candle1m.symbol == symbol,
+                        Candle1m.is_confirmed == True  # noqa: E712
+                    )
+                    result = await session.execute(stmt)
+                    count = result.scalar() or 0
+
+                    if count < required_candles * 0.9:  # Allow 10% tolerance
+                        symbols_to_backfill.append(symbol)
+                        logger.debug(
+                            "Symbol %s needs backfill: %d/%d candles",
+                            symbol, count, required_candles
+                        )
+                except Exception as e:
+                    logger.warning("Error checking candles for %s: %s", symbol, e)
+                    symbols_to_backfill.append(symbol)
+
+        if not symbols_to_backfill:
+            logger.info("All %d symbols have sufficient candle history", len(symbols))
+            return
+
         logger.info(
-            "Seeding %d days of historical candles for %d symbols...",
-            settings.seed_days,
-            len(symbols)
+            "Backfilling %d/%d symbols with insufficient history (%d days)...",
+            len(symbols_to_backfill),
+            len(symbols),
+            settings.seed_days
         )
 
         try:
             await self._bybit_client.seed_1m_history_to_db(
                 category=settings.bybit_category,
-                symbols=symbols,
+                symbols=symbols_to_backfill,
                 session_factory=self._db.session_factory,
                 candle_model=Candle1m,
                 days=settings.seed_days,
                 concurrency=settings.seed_concurrency,
             )
-            logger.info("Historical candle seeding complete")
+            logger.info("Historical candle backfill complete for %d symbols", len(symbols_to_backfill))
         except Exception as e:
             logger.error("Error seeding historical candles: {}", e)
             # Continue anyway - strategy will work with available data
@@ -357,15 +402,24 @@ class TradingBot:
             metrics=self._metrics,
         )
 
-        # Load historical data for strategy state
-        for symbol in symbols[:50]:  # Bootstrap first 50 symbols
+        # Load historical data for strategy state (ALL symbols)
+        logger.info("Loading candle history for %d symbols into strategy engine...", len(symbols))
+        loaded_count = 0
+        for i, symbol in enumerate(symbols):
             try:
                 candles = await self._candle_writer.get_recent_candles(symbol, limit=7200)
                 if candles:
                     self._strategy_engine.load_historical_data(symbol, candles)
-                    
+                    loaded_count += 1
+                    if (i + 1) % 50 == 0:
+                        logger.info("Loaded history for %d/%d symbols...", i + 1, len(symbols))
             except Exception as e:
                 logger.debug("Failed to load history for {}: {}", symbol, e)
+
+        logger.info(
+            "Strategy state initialized: %d/%d symbols with history (max_vol, MA14)",
+            loaded_count, len(symbols)
+        )
 
         await self._strategy_engine.start()
 
@@ -448,7 +502,15 @@ class TradingBot:
 
         await self._execution_engine.start()
 
-        logger.info("Trading pipeline initialized")
+        # Order executor service (stub - logs orders without executing)
+        self._order_executor = OrderExecutorService(
+            order_queue=self._order_queue,
+            telegram_queue=self._telegram_queue,
+            dry_run=True,  # Stub mode - only logs orders
+        )
+        await self._order_executor.start()
+
+        logger.info("Trading pipeline initialized (order executor in DRY-RUN mode)")
 
     async def _start_ws_streaming(self, symbols: List[str]) -> None:
         """Start WebSocket streaming for market data."""
@@ -522,7 +584,6 @@ class TradingBot:
                         count = await self._token_sync_service.sync_now()
                         logger.info("Scheduled token sync completed: %d tokens", count)
                         await self._notify(f"Token sync: {count} tokens synced", notify_type="sync")
-
                     except Exception as e:
                         logger.error("Token sync failed: {}", e)
                         await self._notify(f"Token sync failed: {e}", notify_type="error")
@@ -621,10 +682,8 @@ async def main() -> None:
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-
     except KeyboardInterrupt:
         logger.info("Bot interrupted by user")
-
     except Exception as e:
         logger.critical("Unhandled exception: {}", e)
         sys.exit(1)
