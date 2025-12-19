@@ -91,6 +91,54 @@ def test_balance():
     return result
 
 
+def test_sell_all_preview(symbol: str = "BTCUSDT"):
+    """Тест: Предпросмотр продажи всех токенов (без реальной продажи)"""
+    print("\n" + "="*60)
+    print(f"ПРЕДПРОСМОТР: Продажа всех токенов {symbol}")
+    print("="*60)
+    
+    client = create_client()
+    
+    # Извлекаем базовую монету
+    base_coin = symbol.replace("USDT", "").replace("USDC", "")
+    
+    # Получаем цену
+    price = client.get_current_price(symbol, Category.SPOT)
+    print(f"   Текущая цена {symbol}: ${price:,.2f}" if price else "   Цена недоступна")
+    
+    # Получаем баланс
+    balance = client.get_coin_balance(base_coin)
+    
+    if balance and float(balance) > 0:
+        balance_value = float(balance) * price if price else 0
+        print(f"\n   ✅ Найден баланс:")
+        print(f"      {base_coin}: {balance}")
+        print(f"      Стоимость: ~${balance_value:,.2f}")
+        
+        # Проверяем минимум
+        min_info = client.get_min_order_info(symbol, Category.SPOT)
+        min_amt = min_info.get("min_amt")
+        
+        if min_amt:
+            if balance_value >= float(min_amt):
+                print(f"\n   ✅ Можно продать (минимум ${min_amt})")
+            else:
+                print(f"\n   ❌ Нельзя продать: стоимость ${balance_value:.2f} < минимум ${min_amt}")
+    else:
+        print(f"\n   ❌ Баланс {base_coin} = 0 или не найден")
+    
+    # Показываем все балансы
+    print("\n   📊 Все ваши балансы:")
+    all_balances = client.get_all_balances()
+    if all_balances:
+        for coin, bal in all_balances.items():
+            print(f"      • {coin}: {bal}")
+    else:
+        print("      Нет активов")
+    
+    return balance
+
+
 def test_get_price(symbol: str = "BTCUSDT"):
     """Тест 3: Получение текущей цены"""
     print("\n" + "="*60)
@@ -251,20 +299,75 @@ def test_market_sell(symbol: str = "BTCUSDT", qty: str = "0.001", in_usdt: bool 
     
     Args:
         symbol: Торговая пара
-        qty: Количество (в токенах или USDT в зависимости от in_usdt)
+        qty: Количество (в токенах, USDT, или "all" для продажи всех)
         in_usdt: Если True, qty интерпретируется как сумма в USDT
     
     ⚠️ ВНИМАНИЕ: Этот тест создает РЕАЛЬНЫЙ ордер!
     """
-    print("\n" + "="*60)
-    print(f"ТЕСТ: Рыночная продажа {'$' + qty + ' USDT' if in_usdt else qty + ' ' + symbol.replace('USDT', '')}")
-    print("="*60)
-    
     client = create_client()
+    
+    # Извлекаем базовую монету
+    base_coin = symbol.replace("USDT", "").replace("USDC", "")
+    
+    # Проверяем на "all" - продажа всех токенов
+    if qty.lower() == "all":
+        print("\n" + "="*60)
+        print(f"ТЕСТ: Рыночная продажа ВСЕХ {base_coin}")
+        print("="*60)
+        
+        # Показываем текущую цену
+        price = client.get_current_price(symbol, Category.SPOT)
+        print(f"   Текущая цена: ${price:,.2f}" if price else "   Цена недоступна")
+        
+        # Получаем баланс
+        balance = client.get_coin_balance(base_coin) * 0.99
+        if not balance or float(balance) == 0:
+            print(f"\n   ❌ Нет доступного баланса {base_coin}")
+            return None
+        
+        balance_value = float(balance) * price if price else 0
+        print(f"\n   💰 Баланс {base_coin}: {balance}")
+        print(f"   💵 Примерная стоимость: ${balance_value:,.2f}")
+        
+        # Показываем минимальный ордер
+        min_info = client.get_min_order_info(symbol, Category.SPOT)
+        min_qty = min_info.get("min_qty")
+        min_amt = min_info.get("min_amt")
+        
+        print(f"\n   📊 ЛИМИТЫ ОРДЕРА:")
+        if min_qty:
+            print(f"      Мин. количество: {min_qty}")
+        if min_amt:
+            print(f"      Мин. стоимость: ${float(min_amt):.2f} USDT")
+        
+        # Проверяем достаточно ли баланса
+        if min_amt and balance_value < float(min_amt):
+            print(f"\n   ❌ Стоимость баланса (${balance_value:.2f}) меньше минимума (${min_amt})!")
+            return None
+        
+        # Подтверждение
+        confirm = input(f"\n   ⚠️  Продать ВСЕ {balance} {base_coin}? (yes/no): ")
+        if confirm.lower() != "yes":
+            print("   Отменено")
+            return None
+        
+        result = client.market_sell_all(symbol, Category.SPOT)
+        print(format_order_result(result))
+        return result
+    
+    # Обычная продажа (не all)
+    print("\n" + "="*60)
+    print(f"ТЕСТ: Рыночная продажа {'$' + qty + ' USDT' if in_usdt else qty + ' ' + base_coin}")
+    print("="*60)
     
     # Показываем текущую цену
     price = client.get_current_price(symbol, Category.SPOT)
     print(f"   Текущая цена: ${price:,.2f}" if price else "   Цена недоступна")
+    
+    # Показываем баланс
+    balance = client.get_coin_balance(base_coin)
+    if balance:
+        print(f"   💰 Ваш баланс {base_coin}: {balance}")
     
     # Показываем минимальный ордер (полная информация)
     min_info = client.get_min_order_info(symbol, Category.SPOT)
@@ -290,14 +393,14 @@ def test_market_sell(symbol: str = "BTCUSDT", qty: str = "0.001", in_usdt: bool 
         # Показываем примерное количество токенов
         if price:
             approx_qty = usdt_amount / price
-            print(f"\n   💰 ${usdt_amount} USDT ≈ {approx_qty:.6f} {symbol.replace('USDT', '')}")
+            print(f"\n   💰 ${usdt_amount} USDT ≈ {approx_qty:.6f} {base_coin}")
         
         print(f"   📤 Отправляем ордер на продажу на ${qty} USDT (marketUnit=quoteCoin)")
     else:
         # Показываем стоимость
         if price:
             order_value = float(qty) * price
-            print(f"\n   💰 {qty} {symbol.replace('USDT', '')} ≈ ${order_value:.2f}")
+            print(f"\n   💰 {qty} {base_coin} ≈ ${order_value:.2f}")
     
     # Подтверждение
     confirm = input("\n   ⚠️  Создать ордер? (yes/no): ")
@@ -518,6 +621,7 @@ def interactive_menu():
         print("   10. Открытые ордера")
         print("   11. Отменить ордер")
         print("   12. Отменить все ордера")
+        print("   13. Предпросмотр 'Продать всё'")
         print("-"*60)
         print("   0. Выход")
         print("="*60)
@@ -551,13 +655,16 @@ def interactive_menu():
             test_market_buy(symbol, qty, in_usdt)
         elif choice == "7":
             symbol = input("   Введите пару (BTCUSDT): ").strip() or "BTCUSDT"
-            mode = input("   Ввести сумму в USDT? (y/n, по умолчанию n): ").strip().lower()
-            in_usdt = mode == "y" or mode == "yes"
-            if in_usdt:
-                qty = input("   Введите сумму в USDT: ").strip()
+            qty = input("   Введите количество (или 'all' для продажи всех): ").strip()
+            
+            if qty.lower() == "all":
+                test_market_sell(symbol, "all", in_usdt=False)
             else:
-                qty = input("   Введите количество токенов (0.001): ").strip() or "0.001"
-            test_market_sell(symbol, qty, in_usdt)
+                mode = input("   Это сумма в USDT? (y/n, по умолчанию n): ").strip().lower()
+                in_usdt = mode == "y" or mode == "yes"
+                if not qty:
+                    qty = "0.001"
+                test_market_sell(symbol, qty, in_usdt)
         elif choice == "8":
             symbol = input("   Введите пару (BTCUSDT): ").strip() or "BTCUSDT"
             qty = input("   Введите количество (0.001): ").strip() or "0.001"
@@ -578,6 +685,9 @@ def interactive_menu():
         elif choice == "12":
             symbol = input("   Введите пару (пусто = все): ").strip() or None
             test_cancel_all_orders(symbol)
+        elif choice == "13":
+            symbol = input("   Введите пару (BTCUSDT): ").strip() or "BTCUSDT"
+            test_sell_all_preview(symbol)
         else:
             print("   ❌ Неизвестная опция")
         

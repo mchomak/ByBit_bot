@@ -360,6 +360,74 @@ class BybitClient:
             market_unit=market_unit if category == Category.SPOT else None
         )
     
+    def market_sell_all(
+        self,
+        symbol: str,
+        category: Category = Category.SPOT
+    ) -> OrderResult:
+        """
+        Продать ВСЕ токены базовой монеты
+        
+        Args:
+            symbol: Торговая пара (например BTCUSDT)
+            category: Категория
+            
+        Returns:
+            OrderResult с результатом операции
+        """
+        # Извлекаем базовую монету из символа (BTCUSDT -> BTC)
+        # Обычно это всё до USDT/USDC/EUR и т.д.
+        base_coin = symbol.replace("USDT", "").replace("USDC", "").replace("EUR", "").replace("BTC", "" if symbol.endswith("BTC") else "BTC")
+        
+        # Для пар типа BTCUSDT базовая монета - BTC
+        if symbol.endswith("USDT"):
+            base_coin = symbol[:-4]
+        elif symbol.endswith("USDC"):
+            base_coin = symbol[:-4]
+        elif symbol.endswith("EUR"):
+            base_coin = symbol[:-3]
+        elif symbol.endswith("BTC"):
+            base_coin = symbol[:-3]
+        
+        logger.info(f"Получение баланса {base_coin} для продажи всех токенов")
+        
+        # Получаем баланс
+        balance = self.get_coin_balance(base_coin) * 0.99
+        
+        if not balance or float(balance) == 0:
+            return OrderResult(
+                success=False,
+                message=f"Нет доступного баланса {base_coin} для продажи"
+            )
+        
+        logger.info(f"Найден баланс: {balance} {base_coin}")
+        
+        # Получаем информацию о минимальном ордере и точности
+        min_info = self.get_min_order_info(symbol, category)
+        base_precision = min_info.get("base_precision", "0.000001")
+        min_qty = min_info.get("min_qty", "0")
+        
+        # Определяем количество знаков после запятой
+        if "." in base_precision:
+            decimals = len(base_precision.split(".")[1].rstrip("0")) or 1
+        else:
+            decimals = 6
+        
+        # Форматируем баланс с правильной точностью
+        qty = f"{float(balance):.{decimals}f}"
+        
+        # Проверяем минимум
+        if float(qty) < float(min_qty):
+            return OrderResult(
+                success=False,
+                message=f"Баланс {qty} {base_coin} меньше минимального ордера {min_qty}"
+            )
+        
+        logger.info(f"Продажа всех токенов: {qty} {base_coin}")
+        
+        # Продаем
+        return self.market_sell(symbol, qty, category, in_quote_coin=False)
+    
     def limit_buy(
         self,
         symbol: str,
@@ -557,6 +625,50 @@ class BybitClient:
                 return float(result[0].get("lastPrice", 0))
         return None
     
+    def get_coin_balance(self, coin: str, account_type: str = "UNIFIED") -> Optional[str]:
+        """
+        Получить баланс конкретной монеты
+        
+        Args:
+            coin: Монета (BTC, ETH, USDT и т.д.)
+            account_type: Тип аккаунта (UNIFIED, SPOT, CONTRACT)
+            
+        Returns:
+            Доступный баланс в виде строки или None
+        """
+        result = self.get_wallet_balance(account_type, coin)
+        if result.get("retCode") == 0:
+            accounts = result.get("result", {}).get("list", [])
+            for account in accounts:
+                for coin_data in account.get("coin", []):
+                    if coin_data.get("coin") == coin:
+                        # Возвращаем доступный для торговли баланс
+                        available = coin_data.get("availableToWithdraw", "0")
+                        # Если availableToWithdraw пуст, берем walletBalance
+                        if not available or float(available) == 0:
+                            available = coin_data.get("walletBalance", "0")
+
+                        return float(available)
+        return None
+    
+    def get_all_balances(self, account_type: str = "UNIFIED") -> Dict[str, str]:
+        """
+        Получить все балансы с ненулевым значением
+        
+        Returns:
+            Словарь {coin: balance}
+        """
+        balances = {}
+        result = self.get_wallet_balance(account_type)
+        if result.get("retCode") == 0:
+            accounts = result.get("result", {}).get("list", [])
+            for account in accounts:
+                for coin_data in account.get("coin", []):
+                    balance = float(coin_data.get("walletBalance", 0))
+                    if balance > 0:
+                        balances[coin_data.get("coin")] = coin_data.get("walletBalance")
+        return balances
+
     def get_min_order_qty(self, symbol: str, category: Category = Category.SPOT) -> Optional[str]:
         """Получить минимальный размер ордера"""
         info = self.get_instruments_info(category, symbol)
