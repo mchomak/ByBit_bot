@@ -59,7 +59,7 @@ class OrderResult:
     data: Optional[Dict] = None
 
 
-class BybitClient:
+class Tradeclient:
     """
     Клиент для работы с Bybit API V5
     

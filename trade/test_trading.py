@@ -6,8 +6,8 @@ Bybit Trading Client - Тестовый файл
 ⚠️  ВАЖНО: Сначала тестируйте на TESTNET!
 """
 
-from bybit_client import (
-    BybitClient,
+from test.trade_client import (
+    Tradeclient,
     Category,
     OrderSide,
     OrderType,
@@ -35,7 +35,7 @@ USE_TESTNET = False
 
 def create_client():
     """Создание клиента Bybit"""
-    return BybitClient(
+    return Tradeclient(
         api_key=API_KEY,
         api_secret=API_SECRET,
         testnet=USE_TESTNET
