@@ -122,6 +122,22 @@ class Settings:
     )
 
     # ==========================================================================
+    # Order Execution
+    # ==========================================================================
+    # Set to False to enable real trading (True = dry-run/paper trading)
+    dry_run: bool = field(
+        default_factory=lambda: os.getenv("DRY_RUN", "true").lower() == "true"
+    )
+    # Maximum concurrent order executions
+    order_max_concurrent: int = field(
+        default_factory=lambda: int(os.getenv("ORDER_MAX_CONCURRENT", "1"))
+    )
+    # Number of retries for failed orders
+    order_retry_count: int = field(
+        default_factory=lambda: int(os.getenv("ORDER_RETRY_COUNT", "3"))
+    )
+
+    # ==========================================================================
     # Telegram Notifications
     # ==========================================================================
     telegram_bot_token: str = field(

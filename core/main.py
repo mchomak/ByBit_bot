@@ -46,6 +46,11 @@ from services.strategy_engine import StrategyEngine
 from services.execution_engine import ExecutionEngine
 from services.token_sync_service import TokenSyncService
 from services.order_executor import OrderExecutorService, OrderRequest, OrderSide, OrderType
+from services.real_order_executor import (
+    RealOrderExecutorService,
+    create_place_order_function,
+    create_get_balance_function,
+)
 
 
 class TradingBot:
@@ -84,6 +89,7 @@ class TradingBot:
         self._strategy_engine: Optional[StrategyEngine] = None
         self._execution_engine: Optional[ExecutionEngine] = None
         self._order_executor: Optional[OrderExecutorService] = None
+        self._real_order_executor: Optional[RealOrderExecutorService] = None
         self._token_sync_service: Optional[TokenSyncService] = None
         self._telegram_notifier: Optional[TelegramNotifier] = None
 
@@ -175,6 +181,9 @@ class TradingBot:
         # Stop components in reverse order
         if self._order_executor:
             await self._order_executor.stop()
+
+        if self._real_order_executor:
+            await self._real_order_executor.stop()
 
         if self._execution_engine:
             await self._execution_engine.stop()
@@ -423,6 +432,48 @@ class TradingBot:
 
         await self._strategy_engine.start()
 
+        # Initialize real order executor if not in dry-run mode
+        place_order_fn = None
+        get_balance_fn = None
+
+        if not settings.dry_run:
+            if not settings.bybit_api_key or not settings.bybit_api_secret:
+                logger.error("API keys required for live trading! Falling back to dry-run mode.")
+                await self._notify(
+                    "⚠️ API keys not configured! Running in DRY-RUN mode.",
+                    notify_type="error"
+                )
+            else:
+                logger.info("Initializing REAL order executor (LIVE TRADING MODE)...")
+                self._real_order_executor = RealOrderExecutorService(
+                    api_key=settings.bybit_api_key,
+                    api_secret=settings.bybit_api_secret,
+                    session_factory=self._db.session_factory,
+                    order_model=Order,
+                    telegram_queue=self._telegram_queue,
+                    testnet=settings.bybit_testnet,
+                    max_concurrent=settings.order_max_concurrent,
+                    retry_count=settings.order_retry_count,
+                    category=settings.bybit_category,
+                )
+                await self._real_order_executor.start()
+
+                # Create functions for ExecutionEngine
+                place_order_fn = create_place_order_function(self._real_order_executor)
+                get_balance_fn = create_get_balance_function(self._real_order_executor)
+
+                logger.warning("=" * 60)
+                logger.warning("LIVE TRADING MODE ENABLED - REAL ORDERS WILL BE PLACED")
+                logger.warning("=" * 60)
+
+                await self._notify(
+                    "🔴 <b>LIVE TRADING MODE ENABLED</b>\n"
+                    "Real orders will be placed on Bybit!",
+                    notify_type="status"
+                )
+        else:
+            logger.info("Running in DRY-RUN mode (no real orders)")
+
         # Execution engine with trading decision logging
         self._execution_engine = ExecutionEngine(
             signal_queue=self._signal_queue,
@@ -434,6 +485,8 @@ class TradingBot:
             max_positions=settings.max_positions,
             risk_per_trade_pct=settings.risk_per_trade_pct,
             min_trade_usdt=settings.min_trade_amount_usdt,
+            get_balance_fn=get_balance_fn,
+            place_order_fn=place_order_fn,
             metrics=self._metrics,
         )
 
@@ -502,15 +555,16 @@ class TradingBot:
 
         await self._execution_engine.start()
 
-        # Order executor service (stub - logs orders without executing)
+        # Order executor service (stub for order queue - kept for compatibility)
         self._order_executor = OrderExecutorService(
             order_queue=self._order_queue,
             telegram_queue=self._telegram_queue,
-            dry_run=True,  # Stub mode - only logs orders
+            dry_run=settings.dry_run,
         )
         await self._order_executor.start()
 
-        logger.info("Trading pipeline initialized (order executor in DRY-RUN mode)")
+        mode = "DRY-RUN" if settings.dry_run else "LIVE TRADING"
+        logger.info("Trading pipeline initialized (mode: {})", mode)
 
     async def _start_ws_streaming(self, symbols: List[str]) -> None:
         """Start WebSocket streaming for market data."""
@@ -663,7 +717,8 @@ async def main() -> None:
     setup_logging(settings.log_dir, telegram_queue=telegram_queue)
 
     logger.info("Starting Bybit Trading Bot...")
-    logger.info("Config: category=%s, testnet=%s", settings.bybit_category, settings.bybit_testnet)
+    logger.info("Config: category=%s, testnet=%s, dry_run=%s",
+                settings.bybit_category, settings.bybit_testnet, settings.dry_run)
 
     # Create bot instance
     bot = TradingBot()
@@ -675,8 +730,20 @@ async def main() -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, signal_handler(bot))
 
-    # Run bot
-    await bot.start()
+    # Run bot with global error handling
+    try:
+        await bot.start()
+    except Exception as e:
+        logger.critical("Unhandled exception in main loop: {}", e)
+        # Try to send error to Telegram
+        try:
+            error_msg = f"<b>🔴 CRITICAL ERROR</b>\n\nBot crashed: {e}"
+            telegram_queue.put_nowait({"text": error_msg, "parse_mode": "HTML"})
+            # Give a moment for the message to be sent
+            await asyncio.sleep(2)
+        except Exception:
+            pass
+        raise
 
 
 if __name__ == "__main__":
