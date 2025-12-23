@@ -1,9 +1,3 @@
-"""
-Bybit Order Queue - Тестирование
-=================================
-⚠️ Сначала тестируйте на TESTNET!
-"""
-
 import asyncio
 from trade_client import OrderQueue, OrderStatus, format_order
 
@@ -35,11 +29,11 @@ async def test_info():
     try:
         # Цена
         price = await queue.get_price("BTCUSDT")
-        print(f"   💰 BTC: ${price:,.2f}" if price else "   ❌ Нет связи")
+        print(f"    BTC: ${price:,.2f}" if price else "   ❌ Нет связи")
         
         # Баланс
         balances = await queue.get_balance()
-        print(f"\n   📊 Баланс:")
+        print(f"\n    Баланс:")
         if balances:
             for coin, bal in balances.items():
                 print(f"      {coin}: {bal}")
@@ -48,7 +42,7 @@ async def test_info():
         
         # Минимум
         min_order = await queue.get_min_order("BTCUSDT")
-        print(f"\n   📋 Мин. ордер BTCUSDT: ${min_order.get('min_amt', '?')}")
+        print(f"\n    Мин. ордер BTCUSDT: ${min_order.get('min_amt', '?')}")
         
     finally:
         await queue._api.close()
@@ -99,21 +93,21 @@ async def test_queue_interactive():
                 amount = input("   Сумма USDT: ").strip()
                 if amount:
                     oid = await queue.buy(symbol, amount)
-                    print(f"   📥 {oid}")
+                    print(f"    {oid}")
             
             elif cmd == "2":
                 symbol = input("   Пара (BTCUSDT): ").strip() or "BTCUSDT"
                 amount = input("   Количество: ").strip()
                 if amount:
                     oid = await queue.sell(symbol, amount)
-                    print(f"   📥 {oid}")
+                    print(f"    {oid}")
             
             elif cmd == "3":
                 symbol = input("   Пара (BTCUSDT): ").strip() or "BTCUSDT"
                 confirm = input(f"   Продать ВСЁ {symbol.replace('USDT','')}? (yes): ")
                 if confirm == "yes":
                     oid = await queue.sell(symbol, "all")
-                    print(f"   📥 {oid}")
+                    print(f"    {oid}")
             
             elif cmd == "4":
                 symbol = input("   Пара (BTCUSDT): ").strip() or "BTCUSDT"
@@ -121,19 +115,19 @@ async def test_queue_interactive():
                 price = input("   Цена: ").strip()
                 if qty and price:
                     oid = await queue.buy(symbol, qty, price=price)
-                    print(f"   📥 {oid}")
+                    print(f"    {oid}")
             
             elif cmd == "5":
-                print(f"\n   📊 {queue.stats}")
+                print(f"\n    {queue.stats}")
             
             elif cmd == "6":
-                print(f"\n   📋 Ордера ({len(queue._orders)}):")
+                print(f"\n    Ордера ({len(queue._orders)}):")
                 for o in queue._orders.values():
                     print(f"      {format_order(o)}")
             
             elif cmd == "7":
                 orders = await queue.get_open_orders()
-                print(f"\n   📋 На бирже ({len(orders)}):")
+                print(f"\n    На бирже ({len(orders)}):")
                 for o in orders:
                     print(f"      {o.get('orderId')}: {o.get('side')} {o.get('qty')} @ {o.get('price')}")
             
@@ -171,15 +165,15 @@ async def test_batch():
         
         ids = []
         ids.append(await queue.buy("BTCUSDT", "10", priority=0))
-        print(f"   📥 Buy $10 (priority=0)")
+        print(f"    Buy $10 (priority=0)")
         
         ids.append(await queue.buy("BTCUSDT", "15", priority=10))
-        print(f"   📥 Buy $15 (priority=10) ← выполнится первым!")
+        print(f"    Buy $15 (priority=10) ← выполнится первым!")
         
         ids.append(await queue.buy("BTCUSDT", "5", priority=5))
-        print(f"   📥 Buy $5 (priority=5)")
+        print(f"    Buy $5 (priority=5)")
         
-        print(f"\n   ⏳ Ожидание...")
+        print(f"\n    Ожидание...")
         
         for oid in ids:
             await queue.wait(oid, timeout=30)
@@ -287,7 +281,7 @@ async def main():
 ╔══════════════════════════════════════════════════════════════╗
 ║              BYBIT ORDER QUEUE - ТЕСТИРОВАНИЕ                ║
 ╠══════════════════════════════════════════════════════════════╣
-║  Режим: {'🧪 TESTNET' if USE_TESTNET else '💰 MAINNET'}                                            ║
+║  Режим: {' TESTNET' if USE_TESTNET else ' MAINNET'}     ║
 ║  Установка: pip install aiohttp                              ║
 ╚══════════════════════════════════════════════════════════════╝
 """)
@@ -306,7 +300,7 @@ async def main():
         cmd = input("\n   > ").strip()
         
         if cmd == "0":
-            print("\n   👋 Пока!")
+            print("\n    Пока!")
             break
         elif cmd == "1":
             await test_info()

@@ -68,6 +68,7 @@ class TradingIntegrationTest:
         test_telegram: bool = True,
         test_real_orders: bool = False,
         sell_delay_seconds: int = 30,  # Reduced from 5 minutes for testing
+        cleanup_before: bool = False,  # Clean up test data before running
     ):
         """
         Initialize the integration test.
@@ -76,10 +77,12 @@ class TradingIntegrationTest:
             test_telegram: Whether to test Telegram notifications
             test_real_orders: Whether to test real order placement (CAUTION!)
             sell_delay_seconds: Delay before triggering sell (default 30s for testing)
+            cleanup_before: Whether to clean up old test data before running
         """
         self.test_telegram = test_telegram
         self.test_real_orders = test_real_orders
         self.sell_delay_seconds = sell_delay_seconds
+        self.cleanup_before = cleanup_before
 
         # Components
         self._db: Optional[Database] = None
@@ -107,6 +110,10 @@ class TradingIntegrationTest:
         self._db = Database(database_url=settings.database_url)
         await self._db.create_tables()
         logger.info("Database initialized")
+
+        # 1.5 Clean up old test data if requested
+        if self.cleanup_before:
+            await self._cleanup_test_data()
 
         # 2. Initialize Telegram notifier (if configured)
         if self.test_telegram and settings.is_telegram_configured():
@@ -201,6 +208,39 @@ class TradingIntegrationTest:
         # Note: This runs in parallel with the real notifier
         # We just log what's being sent
         pass  # The TelegramNotifier consumes the queue directly
+
+    async def _cleanup_test_data(self) -> None:
+        """Clean up old test data for the test symbol."""
+        from sqlalchemy import delete
+
+        logger.info("Cleaning up old test data for {}...", self.TEST_SYMBOL)
+
+        try:
+            async with self._db.session_factory() as session:
+                # Delete positions
+                stmt = delete(Position).where(Position.symbol == self.TEST_SYMBOL)
+                result = await session.execute(stmt)
+                pos_count = result.rowcount
+
+                # Delete signals
+                stmt = delete(Signal).where(Signal.symbol == self.TEST_SYMBOL)
+                result = await session.execute(stmt)
+                sig_count = result.rowcount
+
+                # Delete orders
+                stmt = delete(Order).where(Order.symbol == self.TEST_SYMBOL)
+                result = await session.execute(stmt)
+                ord_count = result.rowcount
+
+                await session.commit()
+
+                logger.info(
+                    "Cleaned up: {} positions, {} signals, {} orders",
+                    pos_count, sig_count, ord_count
+                )
+
+        except Exception as e:
+            logger.error("Failed to clean up test data: {}", e)
 
     async def _send_test_notification(self, message: str) -> None:
         """Send a test notification to Telegram."""
@@ -317,13 +357,13 @@ class TradingIntegrationTest:
 
         try:
             async with self._db.session_factory() as session:
-                # Check for open position
+                # Check for open position (get the most recent one)
                 stmt = select(Position).where(
                     Position.symbol == self.TEST_SYMBOL,
                     Position.status == PositionStatus.OPEN
-                )
+                ).order_by(Position.entry_time.desc()).limit(1)
                 result = await session.execute(stmt)
-                position = result.scalar_one_or_none()
+                position = result.scalars().first()
 
                 if position:
                     logger.info("Found OPEN position: id={}, entry_price={}",
@@ -434,13 +474,13 @@ class TradingIntegrationTest:
 
         try:
             async with self._db.session_factory() as session:
-                # Check for closed position
+                # Check for closed position (get the most recent one)
                 stmt = select(Position).where(
                     Position.symbol == self.TEST_SYMBOL,
                     Position.status == PositionStatus.CLOSED
-                ).order_by(Position.exit_time.desc())
+                ).order_by(Position.exit_time.desc()).limit(1)
                 result = await session.execute(stmt)
-                position = result.scalar_one_or_none()
+                position = result.scalars().first()
 
                 if position:
                     logger.info("Found CLOSED position: id={}, profit={:.2f} USDT ({:.2f}%)",
@@ -588,6 +628,11 @@ async def main():
         default=30,
         help="Delay in seconds before sell test (default: 30)"
     )
+    parser.add_argument(
+        "--cleanup",
+        action="store_true",
+        help="Clean up old test data before running"
+    )
 
     args = parser.parse_args()
 
@@ -616,6 +661,7 @@ async def main():
         test_telegram=not args.no_telegram,
         test_real_orders=args.real_orders,
         sell_delay_seconds=args.sell_delay,
+        cleanup_before=args.cleanup,
     )
 
     await test.run_all_tests()
