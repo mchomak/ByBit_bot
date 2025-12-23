@@ -45,7 +45,6 @@ from services.pipeline_events import PipelineMetrics, CandleUpdate, TradingSigna
 from services.strategy_engine import StrategyEngine
 from services.execution_engine import ExecutionEngine
 from services.token_sync_service import TokenSyncService
-from services.order_executor import OrderExecutorService, OrderRequest, OrderSide, OrderType
 from services.real_order_executor import (
     RealOrderExecutorService,
     create_place_order_function,
@@ -75,7 +74,6 @@ class TradingBot:
         self._marketdata_queue: asyncio.Queue[CandleUpdate] = asyncio.Queue(maxsize=10000)
         self._db_write_queue: asyncio.Queue = asyncio.Queue(maxsize=50000)
         self._signal_queue: asyncio.Queue[TradingSignal] = asyncio.Queue(maxsize=1000)
-        self._order_queue: asyncio.Queue[OrderRequest] = asyncio.Queue(maxsize=500)
         self._telegram_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=500)
 
         # Shared metrics
@@ -88,7 +86,6 @@ class TradingBot:
         self._candle_writer: Optional[CandleWriterService] = None
         self._strategy_engine: Optional[StrategyEngine] = None
         self._execution_engine: Optional[ExecutionEngine] = None
-        self._order_executor: Optional[OrderExecutorService] = None
         self._real_order_executor: Optional[RealOrderExecutorService] = None
         self._token_sync_service: Optional[TokenSyncService] = None
         self._telegram_notifier: Optional[TelegramNotifier] = None
@@ -435,7 +432,7 @@ class TradingBot:
         # Initialize real order executor if not in dry-run mode
         place_order_fn = None
         get_balance_fn = None
-
+        logger.info(f"{settings.dry_run} :)")
         if not settings.dry_run:
             if not settings.bybit_api_key or not settings.bybit_api_secret:
                 logger.error("API keys required for live trading! Falling back to dry-run mode.")
@@ -508,13 +505,22 @@ class TradingBot:
 
             # Check if position was opened
             if signal.symbol in self._execution_engine._open_positions:
-                msg = (
-                    f"BUY {signal.symbol}\n"
-                    f"Price: {signal.price:.6f}\n"
-                    f"Volume ratio: {signal.volume_ratio:.2f}x\n"
-                    f"Price change: {signal.price_change_pct:.2f}%"
+                # Extract coin name from symbol (e.g., BTCUSDT -> BTC)
+                coin = signal.symbol.replace("USDT", "").replace("USDC", "")
+                current_time = datetime.now().strftime("%H:%M:%S")
+
+                # Calculate position size based on balance and risk
+                balance = await self._execution_engine._get_available_balance()
+                position_usdt = balance * self._execution_engine._risk_pct
+
+                # Use template from config
+                msg = settings.telegram_entry_template.format(
+                    symbol=coin,
+                    price=f"{signal.price:.6f}",
+                    position_size=f"{position_usdt:.2f}",
+                    time=current_time,
                 )
-                self._trading_log.info("ENTRY EXECUTED: {}", msg.replace('\n', ' | '))
+                self._trading_log.info("ENTRY EXECUTED: {} @ {} | size={:.2f} USDT", coin, signal.price, position_usdt)
                 await self._notify(msg, notify_type="trade")
 
         async def logged_handle_exit(signal: TradingSignal) -> None:
@@ -540,28 +546,27 @@ class TradingBot:
                 profit_usdt = exit_value - position.entry_value_usdt
                 profit_pct = (profit_usdt / position.entry_value_usdt) * 100
 
-                emoji = "+" if profit_usdt >= 0 else ""
-                msg = (
-                    f"SELL {signal.symbol}\n"
-                    f"Exit price: {signal.price:.6f}\n"
-                    f"Entry price: {position.entry_price:.6f}\n"
-                    f"P&L: {emoji}{profit_usdt:.2f} USDT ({emoji}{profit_pct:.2f}%)"
+                # Extract coin name from symbol
+                coin = signal.symbol.replace("USDT", "").replace("USDC", "")
+                current_time = datetime.now().strftime("%H:%M:%S")
+                profit_sign = "+" if profit_pct >= 0 else ""
+
+                # Use template from config
+                msg = settings.telegram_exit_template.format(
+                    symbol=coin,
+                    exit_price=f"{signal.price:.6f}",
+                    exit_value=f"{exit_value:.2f}",
+                    profit_sign=profit_sign,
+                    profit_pct=f"{profit_pct:.1f}",
+                    time=current_time,
                 )
-                self._trading_log.info("EXIT EXECUTED: {}", msg.replace('\n', ' | '))
+                self._trading_log.info("EXIT EXECUTED: {} @ {} | P&L: {}{:.2f}%", coin, signal.price, profit_sign, profit_pct)
                 await self._notify(msg, notify_type="trade")
 
         self._execution_engine._handle_entry = logged_handle_entry
         self._execution_engine._handle_exit = logged_handle_exit
 
         await self._execution_engine.start()
-
-        # Order executor service (stub for order queue - kept for compatibility)
-        self._order_executor = OrderExecutorService(
-            order_queue=self._order_queue,
-            telegram_queue=self._telegram_queue,
-            dry_run=settings.dry_run,
-        )
-        await self._order_executor.start()
 
         mode = "DRY-RUN" if settings.dry_run else "LIVE TRADING"
         logger.info("Trading pipeline initialized (mode: {})", mode)

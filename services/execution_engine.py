@@ -229,8 +229,12 @@ class ExecutionEngine:
 
         quantity = position_usdt / signal.price
 
-        # Place order
-        order_result = await self._execute_buy(symbol, quantity, signal.price)
+        # Place order with context for notifications
+        order_result = await self._execute_buy(
+            symbol, quantity, signal.price,
+            volume_ratio=signal.volume_ratio,
+            price_change_pct=signal.price_change_pct,
+        )
 
         if order_result.get("success"):
             # Record entry
@@ -282,8 +286,19 @@ class ExecutionEngine:
             self._log.warning("Position %d not found for %s", position_id, symbol)
             return
 
-        # Place sell order
-        order_result = await self._execute_sell(symbol, position.entry_amount, signal.price)
+        # Calculate expected P&L for context
+        exit_value = position.entry_amount * signal.price
+        expected_profit_usdt = exit_value - position.entry_value_usdt
+        expected_profit_pct = (expected_profit_usdt / position.entry_value_usdt) * 100
+
+        # Place sell order with context for notifications
+        order_result = await self._execute_sell(
+            symbol, position.entry_amount, signal.price,
+            position_id=position_id,
+            entry_price=position.entry_price,
+            expected_pnl_usdt=expected_profit_usdt,
+            expected_pnl_pct=expected_profit_pct,
+        )
 
         if order_result.get("success"):
             # Calculate P&L
@@ -333,12 +348,17 @@ class ExecutionEngine:
         return self._simulated_balance
 
     async def _execute_buy(
-        self, symbol: str, quantity: float, price: float
+        self, symbol: str, quantity: float, price: float, **context
     ) -> Dict[str, Any]:
-        """Execute a buy order."""
+        """Execute a buy order with optional context for notifications."""
         if self._place_order:
             try:
-                return await self._place_order(symbol, "Buy", quantity, price)
+                return await self._place_order(
+                    symbol, "Buy", quantity, price,
+                    signal_type="entry",
+                    volume_ratio=context.get("volume_ratio"),
+                    price_change_pct=context.get("price_change_pct"),
+                )
             except Exception as e:
                 self._log.exception("Buy order failed: %s", e)
                 return {"success": False, "error": str(e)}
@@ -351,12 +371,19 @@ class ExecutionEngine:
         }
 
     async def _execute_sell(
-        self, symbol: str, quantity: float, price: float
+        self, symbol: str, quantity: float, price: float, **context
     ) -> Dict[str, Any]:
-        """Execute a sell order."""
+        """Execute a sell order with optional context for notifications."""
         if self._place_order:
             try:
-                return await self._place_order(symbol, "Sell", quantity, price)
+                return await self._place_order(
+                    symbol, "Sell", quantity, price,
+                    signal_type="exit",
+                    position_id=context.get("position_id"),
+                    entry_price=context.get("entry_price"),
+                    expected_pnl_usdt=context.get("expected_pnl_usdt"),
+                    expected_pnl_pct=context.get("expected_pnl_pct"),
+                )
             except Exception as e:
                 self._log.exception("Sell order failed: %s", e)
                 return {"success": False, "error": str(e)}

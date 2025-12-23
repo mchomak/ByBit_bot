@@ -157,6 +157,20 @@ class Settings:
         default_factory=lambda: float(os.getenv("TELEGRAM_RATE_LIMIT_S", "1.0"))
     )
 
+    # Telegram notification templates
+    telegram_entry_template: str = field(
+        default_factory=lambda: os.getenv(
+            "TELEGRAM_ENTRY_TEMPLATE",
+            "🟢 Purchase\nCoin: {symbol}\nEntry price: {price}\nPosition Size: {position_size} USDT\nTime: {time}"
+        )
+    )
+    telegram_exit_template: str = field(
+        default_factory=lambda: os.getenv(
+            "TELEGRAM_EXIT_TEMPLATE",
+            "🔴 Sale\nCoin: {symbol}\nExit Price: {exit_price}\nTotal withdrawal amount: {exit_value} USDT\nProfit: {profit_sign}{profit_pct}%\nTime: {time}"
+        )
+    )
+
     # ==========================================================================
     # Logging
     # ==========================================================================

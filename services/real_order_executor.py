@@ -19,7 +19,7 @@ import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from trade.trade_client import OrderQueue, QueuedOrder, OrderStatus, Category
-from services.order_executor import OrderRequest, OrderSide, OrderType, OrderResult
+from config.config import settings
 
 
 class RealOrderExecutorService:
@@ -319,49 +319,56 @@ class RealOrderExecutorService:
         context: Dict[str, Any],
         success: bool,
     ) -> None:
-        """Send Telegram notification for order."""
+        """Send Telegram notification for order using templates from config."""
         if not self._telegram_queue:
             return
 
         try:
-            signal_type = context.get("signal_type", "")
+            from datetime import datetime
+
+            current_time = datetime.now().strftime("%H:%M:%S")
 
             if success:
                 if order.side.value == "Buy":
-                    msg = (
-                        f"<b>🟢 BUY Order Executed</b>\n\n"
-                        f"<b>Symbol:</b> {order.symbol}\n"
-                        f"<b>Quantity:</b> {order.qty}\n"
-                        f"<b>Price:</b> {order.price or 'MARKET'}\n"
-                        f"<b>Order ID:</b> {order.result.order_id if order.result else 'N/A'}\n"
-                    )
-                    if context.get("volume_ratio"):
-                        msg += f"<b>Volume Ratio:</b> {context['volume_ratio']:.2f}x\n"
-                    if context.get("price_change_pct"):
-                        msg += f"<b>Price Change:</b> {context['price_change_pct']:.2f}%\n"
-                else:
-                    pnl = context.get("expected_pnl_usdt", 0)
-                    pnl_pct = context.get("expected_pnl_pct", 0)
-                    emoji = "🟢" if pnl >= 0 else "🔴"
-                    pnl_sign = "+" if pnl >= 0 else ""
+                    # Entry signal template
+                    # Extract coin name from symbol (e.g., BTCUSDT -> BTC)
+                    coin = order.symbol.replace("USDT", "").replace("USDC", "")
+                    price = float(order.price) if order.price else context.get("price", 0)
+                    quantity = float(order.qty)
+                    position_size = quantity * price if price else 0
 
-                    msg = (
-                        f"<b>{emoji} SELL Order Executed</b>\n\n"
-                        f"<b>Symbol:</b> {order.symbol}\n"
-                        f"<b>Quantity:</b> {order.qty}\n"
-                        f"<b>Exit Price:</b> {order.price or 'MARKET'}\n"
-                        f"<b>Entry Price:</b> {context.get('entry_price', 'N/A')}\n"
-                        f"<b>P&L:</b> {pnl_sign}{pnl:.2f} USDT ({pnl_sign}{pnl_pct:.2f}%)\n"
-                        f"<b>Order ID:</b> {order.result.order_id if order.result else 'N/A'}\n"
+                    msg = settings.telegram_entry_template.format(
+                        symbol=coin,
+                        price=f"{price:.6f}",
+                        position_size=f"{position_size:.2f}",
+                        time=current_time,
+                    )
+                else:
+                    # Exit signal template
+                    coin = order.symbol.replace("USDT", "").replace("USDC", "")
+                    exit_price = float(order.price) if order.price else context.get("price", 0)
+                    quantity = float(order.qty)
+                    exit_value = quantity * exit_price if exit_price else 0
+                    pnl_pct = context.get("expected_pnl_pct", 0) or 0
+                    profit_sign = "+" if pnl_pct >= 0 else ""
+
+                    msg = settings.telegram_exit_template.format(
+                        symbol=coin,
+                        exit_price=f"{exit_price:.6f}",
+                        exit_value=f"{exit_value:.2f}",
+                        profit_sign=profit_sign,
+                        profit_pct=f"{pnl_pct:.1f}",
+                        time=current_time,
                     )
             else:
                 error_msg = order.result.message if order.result else "Unknown error"
                 msg = (
-                    f"<b>❌ Order Failed</b>\n\n"
-                    f"<b>Symbol:</b> {order.symbol}\n"
-                    f"<b>Side:</b> {order.side.value}\n"
-                    f"<b>Quantity:</b> {order.qty}\n"
-                    f"<b>Error:</b> {error_msg}\n"
+                    f"❌ Order Failed\n\n"
+                    f"Symbol: {order.symbol}\n"
+                    f"Side: {order.side.value}\n"
+                    f"Quantity: {order.qty}\n"
+                    f"Error: {error_msg}\n"
+                    f"Time: {current_time}"
                 )
 
             self._telegram_queue.put_nowait({"text": msg, "parse_mode": "HTML"})
@@ -397,23 +404,32 @@ class RealOrderExecutorService:
 
 def create_place_order_function(
     executor: RealOrderExecutorService,
-) -> Callable[[str, str, float, float], Awaitable[Dict[str, Any]]]:
+) -> Callable[..., Awaitable[Dict[str, Any]]]:
     """
     Create a place_order function for ExecutionEngine.
 
-    Returns an async function with signature: (symbol, side, quantity, price) -> Dict
+    Returns an async function with signature: (symbol, side, quantity, price, **context) -> Dict
+    Supports additional context parameters for notifications.
     """
     async def place_order(
         symbol: str,
         side: str,
         quantity: float,
         price: float,
+        **context
     ) -> Dict[str, Any]:
         return await executor.place_order(
             symbol=symbol,
             side=side,
             quantity=quantity,
             price=price,
+            signal_type=context.get("signal_type", ""),
+            position_id=context.get("position_id"),
+            entry_price=context.get("entry_price"),
+            expected_pnl_usdt=context.get("expected_pnl_usdt"),
+            expected_pnl_pct=context.get("expected_pnl_pct"),
+            volume_ratio=context.get("volume_ratio"),
+            price_change_pct=context.get("price_change_pct"),
         )
 
     return place_order
