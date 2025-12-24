@@ -1,185 +1,329 @@
-"""Создаёт ежедневный отчёт по логам, прогнозам и сделкам."""
+"""Daily trading report generator.
+
+Generates and sends daily trading statistics via Telegram at 00:00.
+"""
 
 from __future__ import annotations
+
+import asyncio
+from datetime import datetime, time, timedelta, timezone
+from typing import Optional
+
+from loguru import logger
+from sqlalchemy import select, func, and_
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import sessionmaker
+
 import sys
 import os
-from pathlib import Path
-from typing import Dict
-import pandas as pd
-import numpy as np
-import plotly.express as px
-from collections import Counter
-from datetime import datetime, time, timedelta
-
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from db.models import PredictLog, TransactionLog
+from db.models import Order, Position, Token, OrderSide, OrderStatus, PositionStatus
 
 
-async def daily_report(logger, report_path, log_path, db_reader, threshold_buy, message_queue) -> None:
+class DailyReportService:
     """
-    Собирает статистику по логам, прогнозам и сделкам за вчерашний день,
-    генерирует графики и сохраняет отчёт в папку reports/YYYY-MM-DD.
+    Service for generating and sending daily trading reports.
+
+    Runs at 00:00 UTC and sends statistics to Telegram.
     """
-    log = logger.bind(component="TraidingBot.daily_report")
 
-    report_path = Path(report_path)
-    log_path    = Path(log_path)
+    def __init__(
+        self,
+        session_factory: sessionmaker,
+        telegram_queue: asyncio.Queue,
+        timezone_str: str = "UTC",
+    ):
+        """
+        Initialize the daily report service.
 
-    report_date = (datetime.utcnow().date() - timedelta(days=1))
-    start_dt = datetime.combine(report_date, time.min)
-    end_dt   = start_dt + timedelta(days=1)
+        Args:
+            session_factory: SQLAlchemy async session factory
+            telegram_queue: Queue for sending Telegram messages
+            timezone_str: Timezone string (default: UTC)
+        """
+        self._session_factory = session_factory
+        self._telegram_queue = telegram_queue
+        self._timezone_str = timezone_str
+        self._task: Optional[asyncio.Task] = None
+        self._stop_event = asyncio.Event()
+        self._log = logger.bind(component="DailyReport")
 
-    # папка для отчёта
-    folder = report_path / report_date.isoformat()
-    folder.mkdir(parents=True, exist_ok=True)
+    async def start(self) -> None:
+        """Start the daily report scheduler."""
+        if self._task is not None:
+            self._log.warning("Daily report service already running")
+            return
 
-    # 1) Статистика по логам
-    level_counters: Dict[str, Counter] = {
-        "WARNING": Counter(),
-        "ERROR":   Counter(),
-        "CRITICAL": Counter(),
-    }
-    for f in log_path.glob("*.log"):
-        for line in f.open(encoding="utf-8", errors="ignore"):
-            try:
-                date_str, lvl, msg = line.split("|", 2)
-                ts = datetime.strptime(date_str.strip(), "%Y-%m-%d %H:%M:%S")
-            except:
-                continue
-
-            lvl = lvl.strip()
-            if ts >= start_dt and ts < end_dt and lvl in level_counters:
-                level_counters[lvl][msg.strip()] += 1
-
-    # сохраняем текстовую часть
-    txt = []
-    txt.append(f"=== Логи за {report_date} ===\n")
-    for lvl in ("CRITICAL","ERROR","WARNING"):
-        cnt = sum(level_counters[lvl].values())
-        txt.append(f"{lvl}: {cnt}\n")
-        for msg, n in level_counters[lvl].most_common():
-            txt.append(f"  {n:4d} × {msg}\n")
-
-        txt.append("\n")
-
-    (folder / "logs_stats.txt").write_text("".join(txt), encoding="utf-8")
-    log.info("Saved log stats")
-
-    # 2) Статистика прогнозов
-    preds = await db_reader.get_all(
-        PredictLog,
-        filters={
-            "time__gte": start_dt,
-            "time__lt":  end_dt,
-        }
-    )
-    probs = np.array([p.prob for p in preds], dtype=float)
-    if probs.size:
-        avg   = probs.mean()
-        med   = np.median(probs)
-        pmax  = probs.max()
-        pmin  = probs.min()
-        thr   = threshold_buy
-        almost = ((probs >= thr - 0.02) & (probs < thr)).sum()
-        above  = (probs >= thr).sum()
-    else:
-        avg = med = pmax = pmin = above = almost = 0
-
-    dfp = pd.DataFrame({
-        "metric": ["avg","median","max","min",f">={thr}",f"≈{thr}±0.02"],
-        "value":  [avg,med,pmax,pmin,above,almost]
-    })
-    dfp.to_csv(folder / "predict_stats.csv", index=False)
-    log.info("Saved predict stats")
-
-    # 3) Статистика по транзакциям
-    # 3.1 По логам ошибок/успехов (берём те же level_counters)
-    # 3.2 Из БД по TransactionLog
-    txs = await db_reader.get_all(
-        TransactionLog,
-        filters={
-            "timestamp__gte": start_dt,
-            "timestamp__lt":  end_dt,
-        }
-    )
-    df = pd.DataFrame([{
-        "time":       t.timestamp,
-        "trade_type": t.trade_type,
-        "profit":     t.profit or 0.0
-    } for t in txs])
-    if df.empty:
-        df = pd.DataFrame(columns=["time","trade_type","profit"])
-
-    # счётчики
-    total = len(df)
-    buys  = (df.trade_type=="buy").sum()
-    sells = (df.trade_type=="sell").sum()
-
-    # пиковый час
-    df["hour"] = df.time.dt.hour
-    peak_hour = int(df["hour"].value_counts().idxmax()) if total else None
-
-    # график числа сделок по времени
-    fig1 = px.histogram(
-        df,
-        x="time",
-        color="trade_type",
-        nbins=24,
-        title=f"Транзакции за {report_date}"
-    )
-    fig1.write_html(str(folder / "tx_count.html"), auto_open=False)
-
-    # график прибыли к времени
-    df_sells = df[df.trade_type=="sell"]
-    if not df_sells.empty:
-        df_sells = df_sells.sort_values("time")
-        df_sells["cum_profit"] = df_sells.profit.cumsum()
-        fig2 = px.line(
-            df_sells,
-            x="time",
-            y="cum_profit",
-            title=f"Кумулятивная прибыль за {report_date}"
+        self._stop_event.clear()
+        self._task = asyncio.create_task(
+            self._scheduler_loop(),
+            name="daily-report-scheduler"
         )
-        fig2.write_html(str(folder / "profit.html"), auto_open=False)
-        total_profit = df_sells.profit.sum()
-    else:
-        total_profit = 0.0
+        self._log.info("Daily report scheduler started (runs at 00:00 UTC)")
 
-    # сохраняем summary
-    summ = [
-        f"=== Транзакции за {report_date} ===\n",
-        f"Всего: {total}, buy: {buys}, sell: {sells}\n",
-        f"Пиковый час: {peak_hour}\n",
-        f"Общая прибыль: {total_profit:.2f}\n",
-    ]
-    (folder / "tx_summary.txt").write_text("".join(summ), encoding="utf-8")
-    log.info("Saved transaction stats")
+    async def stop(self) -> None:
+        """Stop the daily report scheduler."""
+        self._stop_event.set()
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+        self._task = None
+        self._log.info("Daily report scheduler stopped")
 
-    # 4) Причины закрытия (из логов decide_token)
-    reasons = Counter()
-    for f in log_path.glob("*.log"):
-        for line in f.open(encoding="utf-8", errors="ignore"):
-            if report_date.isoformat() in line and "SELL signal for" in line:
-                part = line.split("SELL signal for",1)[1]
-                # " pool: reason →"
-                reason = part.split("→")[0].strip()
-                reasons[reason] += 1
+    async def _scheduler_loop(self) -> None:
+        """Main scheduler loop - runs report at 00:00 UTC daily."""
+        while not self._stop_event.is_set():
+            try:
+                # Calculate time until next 00:00 UTC
+                now = datetime.now(timezone.utc)
+                tomorrow = now.date() + timedelta(days=1)
+                next_midnight = datetime.combine(tomorrow, time.min, tzinfo=timezone.utc)
+                wait_seconds = (next_midnight - now).total_seconds()
 
-    with open(folder / "sell_reasons.txt","w",encoding="utf-8") as fh:
-        fh.write("=== Причины SELL ===\n")
-        for reason, cnt in reasons.most_common():
-            fh.write(f"{cnt:4d} × {reason}\n")
+                self._log.debug(
+                    "Next daily report in {:.1f} hours",
+                    wait_seconds / 3600
+                )
 
-    log.info("Saved sell reasons")
+                # Wait until midnight (or stop event)
+                try:
+                    await asyncio.wait_for(
+                        self._stop_event.wait(),
+                        timeout=wait_seconds
+                    )
+                    # Stop event was set
+                    break
+                except asyncio.TimeoutError:
+                    # Time to run the report
+                    pass
 
-    # 5) Отправляем в Telegram краткий отчёт
-    summary_msg = (
-        f"📊 Ежедневный отчёт за {report_date}:\n"
-        f"Логи: W={len(level_counters['WARNING'])}, "
-        f"E={len(level_counters['ERROR'])}, "
-        f"C={len(level_counters['CRITICAL'])}\n"
-        f"Прогнозов: {len(probs)}, транзакций: {total}, профит: {total_profit:.2f}"
-    )
-    await message_queue.put(summary_msg)
-    log.success("Daily report done")
+                # Generate and send report
+                await self.generate_and_send_report()
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self._log.exception("Error in daily report scheduler: {}", e)
+                await asyncio.sleep(60)  # Wait before retry
+
+    async def generate_and_send_report(self, report_date: datetime = None) -> None:
+        """
+        Generate and send the daily report.
+
+        Args:
+            report_date: Date to report on (default: yesterday)
+        """
+        try:
+            # Default to yesterday
+            if report_date is None:
+                report_date = datetime.now(timezone.utc).date() - timedelta(days=1)
+
+            start_dt = datetime.combine(report_date, time.min, tzinfo=timezone.utc)
+            end_dt = start_dt + timedelta(days=1)
+
+            self._log.info("Generating daily report for {}", report_date)
+
+            async with self._session_factory() as session:
+                # 1. Get order statistics
+                order_stats = await self._get_order_stats(session, start_dt, end_dt)
+
+                # 2. Get position/profit statistics
+                profit_stats = await self._get_profit_stats(session, start_dt, end_dt)
+
+                # 3. Get active tokens count
+                active_tokens = await self._get_active_tokens_count(session)
+
+            # Format and send the report
+            report_msg = self._format_report(
+                report_date,
+                order_stats,
+                profit_stats,
+                active_tokens
+            )
+
+            self._telegram_queue.put_nowait({
+                "text": report_msg,
+                "parse_mode": "HTML"
+            })
+
+            self._log.info("Daily report sent successfully")
+
+        except Exception as e:
+            self._log.exception("Failed to generate daily report: {}", e)
+            # Send error notification
+            try:
+                self._telegram_queue.put_nowait({
+                    "text": f"❌ Failed to generate daily report: {e}",
+                    "parse_mode": "HTML"
+                })
+            except:
+                pass
+
+    async def _get_order_stats(
+        self,
+        session: AsyncSession,
+        start_dt: datetime,
+        end_dt: datetime
+    ) -> dict:
+        """Get order statistics for the period."""
+        # Total orders
+        total_result = await session.execute(
+            select(func.count(Order.id)).where(
+                and_(
+                    Order.created_at >= start_dt,
+                    Order.created_at < end_dt
+                )
+            )
+        )
+        total_orders = total_result.scalar() or 0
+
+        # Buy orders
+        buy_result = await session.execute(
+            select(func.count(Order.id)).where(
+                and_(
+                    Order.created_at >= start_dt,
+                    Order.created_at < end_dt,
+                    Order.side == OrderSide.BUY
+                )
+            )
+        )
+        buy_orders = buy_result.scalar() or 0
+
+        # Sell orders
+        sell_result = await session.execute(
+            select(func.count(Order.id)).where(
+                and_(
+                    Order.created_at >= start_dt,
+                    Order.created_at < end_dt,
+                    Order.side == OrderSide.SELL
+                )
+            )
+        )
+        sell_orders = sell_result.scalar() or 0
+
+        # Filled orders
+        filled_result = await session.execute(
+            select(func.count(Order.id)).where(
+                and_(
+                    Order.created_at >= start_dt,
+                    Order.created_at < end_dt,
+                    Order.status == OrderStatus.FILLED
+                )
+            )
+        )
+        filled_orders = filled_result.scalar() or 0
+
+        return {
+            "total": total_orders,
+            "buys": buy_orders,
+            "sells": sell_orders,
+            "filled": filled_orders,
+        }
+
+    async def _get_profit_stats(
+        self,
+        session: AsyncSession,
+        start_dt: datetime,
+        end_dt: datetime
+    ) -> dict:
+        """Get profit statistics from closed positions."""
+        # Closed positions in the period
+        result = await session.execute(
+            select(Position).where(
+                and_(
+                    Position.exit_time >= start_dt,
+                    Position.exit_time < end_dt,
+                    Position.status == PositionStatus.CLOSED
+                )
+            )
+        )
+        closed_positions = result.scalars().all()
+
+        total_profit_usdt = 0.0
+        total_profit_pct = 0.0
+        winning_trades = 0
+        losing_trades = 0
+
+        for pos in closed_positions:
+            if pos.profit_usdt is not None:
+                total_profit_usdt += pos.profit_usdt
+                if pos.profit_usdt >= 0:
+                    winning_trades += 1
+                else:
+                    losing_trades += 1
+            if pos.profit_pct is not None:
+                total_profit_pct += pos.profit_pct
+
+        return {
+            "closed_positions": len(closed_positions),
+            "total_profit_usdt": total_profit_usdt,
+            "total_profit_pct": total_profit_pct,
+            "winning_trades": winning_trades,
+            "losing_trades": losing_trades,
+        }
+
+    async def _get_active_tokens_count(self, session: AsyncSession) -> int:
+        """Get count of active tokens."""
+        result = await session.execute(
+            select(func.count(Token.id)).where(Token.is_active == True)
+        )
+        return result.scalar() or 0
+
+    def _format_report(
+        self,
+        report_date,
+        order_stats: dict,
+        profit_stats: dict,
+        active_tokens: int
+    ) -> str:
+        """Format the daily report message."""
+        profit_sign = "+" if profit_stats["total_profit_usdt"] >= 0 else ""
+        profit_emoji = "📈" if profit_stats["total_profit_usdt"] >= 0 else "📉"
+
+        # Calculate win rate
+        total_trades = profit_stats["winning_trades"] + profit_stats["losing_trades"]
+        win_rate = (profit_stats["winning_trades"] / total_trades * 100) if total_trades > 0 else 0
+
+        report = (
+            f"<b>📊 Daily Report - {report_date}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+
+            f"<b>📦 Orders:</b>\n"
+            f"  • Total: <b>{order_stats['total']}</b>\n"
+            f"  • Buys: <b>{order_stats['buys']}</b>\n"
+            f"  • Sells: <b>{order_stats['sells']}</b>\n"
+            f"  • Filled: <b>{order_stats['filled']}</b>\n\n"
+
+            f"<b>{profit_emoji} Profit:</b>\n"
+            f"  • Closed trades: <b>{profit_stats['closed_positions']}</b>\n"
+            f"  • Total P&L: <b>{profit_sign}${profit_stats['total_profit_usdt']:.2f}</b>\n"
+            f"  • Win/Loss: <b>{profit_stats['winning_trades']}/{profit_stats['losing_trades']}</b>\n"
+            f"  • Win Rate: <b>{win_rate:.1f}%</b>\n\n"
+
+            f"<b>🪙 Active Tokens:</b> <b>{active_tokens}</b>\n\n"
+
+            f"<i>Report generated at {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC</i>"
+        )
+
+        return report
+
+
+async def generate_daily_report(
+    session_factory: sessionmaker,
+    telegram_queue: asyncio.Queue,
+    report_date: datetime = None
+) -> None:
+    """
+    Convenience function to generate a one-time daily report.
+
+    Args:
+        session_factory: SQLAlchemy async session factory
+        telegram_queue: Queue for sending Telegram messages
+        report_date: Date to report on (default: yesterday)
+    """
+    service = DailyReportService(session_factory, telegram_queue)
+    await service.generate_and_send_report(report_date)

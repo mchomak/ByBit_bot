@@ -36,6 +36,7 @@ from sqlalchemy.orm import sessionmaker
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from config.config import settings
 from core.bootstrap_logging import setup_logging
+from core.create_daily_report import DailyReportService
 from bot.TelegramBot import TelegramBot
 from db.database import Database, CandleWriterService
 from db.models import Candle1m, Position, Order, Signal, Token, User
@@ -89,6 +90,7 @@ class TradingBot:
         self._order_executor: Optional[RealOrderExecutorService] = None
         self._token_sync_service: Optional[TokenSyncService] = None
         self._telegram_bot: Optional[TelegramBot] = None
+        self._daily_report_service: Optional[DailyReportService] = None
 
         # Task handles
         self._ws_task: Optional[asyncio.Task] = None
@@ -137,6 +139,9 @@ class TradingBot:
 
             # 9. Start metrics reporter
             await self._start_metrics_reporter()
+
+            # 10. Start daily report scheduler
+            await self._start_daily_report_scheduler()
 
             # Notify successful start
             await self._notify(
@@ -193,6 +198,9 @@ class TradingBot:
 
         if self._token_sync_service:
             await self._token_sync_service.stop()
+
+        if self._daily_report_service:
+            await self._daily_report_service.stop()
 
         if self._telegram_bot:
             await self._telegram_bot.stop()
@@ -695,6 +703,19 @@ class TradingBot:
                 break
             except Exception as e:
                 logger.error("Error in metrics reporter: {}", e)
+
+    async def _start_daily_report_scheduler(self) -> None:
+        """Start daily report scheduler that runs at 00:00 UTC."""
+        if not settings.is_telegram_configured():
+            logger.info("Daily report disabled (Telegram not configured)")
+            return
+
+        self._daily_report_service = DailyReportService(
+            session_factory=self._db.session_factory,
+            telegram_queue=self._telegram_queue,
+        )
+        await self._daily_report_service.start()
+        logger.info("Daily report scheduler started (runs at 00:00 UTC)")
 
     # =========================================================================
     # Notification Helper
