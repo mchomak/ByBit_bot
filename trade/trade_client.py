@@ -17,6 +17,8 @@ from enum import Enum
 from datetime import datetime
 import logging
 import uuid
+from decimal import Decimal, ROUND_DOWN
+import math
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -53,6 +55,39 @@ class OrderStatus(Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+
+
+# ==================== HELPERS ====================
+
+def truncate_to_step(value: float, step: str) -> str:
+    """
+    Округлить значение вниз до шага (qtyStep от Bybit)
+    
+    Args:
+        value: Значение для округления (например, 0.05730141)
+        step: Шаг из API (например, "0.001" для BTC)
+    
+    Returns:
+        Округлённое значение как строка (например, "0.057")
+    
+    Examples:
+        truncate_to_step(0.05730141, "0.001") -> "0.057"
+        truncate_to_step(1.999, "0.01") -> "1.99"
+        truncate_to_step(123.456, "1") -> "123"
+    """
+    step_decimal = Decimal(step)
+    value_decimal = Decimal(str(value))
+    
+    # Округляем вниз до шага
+    truncated = (value_decimal / step_decimal).to_integral_value(rounding=ROUND_DOWN) * step_decimal
+    
+    # Определяем количество знаков после запятой из шага
+    if '.' in step:
+        decimals = len(step.rstrip('0').split('.')[1]) if step.rstrip('0').split('.')[1] else 0
+    else:
+        decimals = 0
+    
+    return f"{truncated:.{decimals}f}"
 
 
 # ==================== DATACLASSES ====================
@@ -254,12 +289,16 @@ class OrderQueue:
         return None
     
     async def get_balance(self, coin: str = None) -> Dict[str, float]:
-        """Получить баланс (все монеты или конкретную)"""
+        """Получить баланс (все монеты или конкретную)
+
+        Raises:
+            RuntimeError: If API returns an error (enables Telegram notifications)
+        """
         params = {"accountType": "UNIFIED"}
         if coin:
             params["coin"] = coin
         resp = await self._api.request("GET", "/v5/account/wallet-balance", params)
-        
+
         balances = {}
         if resp.get("retCode") == 0:
             for acc in resp.get("result", {}).get("list", []):
@@ -268,11 +307,13 @@ class OrderQueue:
                     if bal > 0:
                         balances[c.get("coin")] = bal
         else:
-            logger.warning(f"get_balance error: {resp.get('retMsg', 'Unknown error')}")
+            error_msg = resp.get('retMsg', 'Unknown error')
+            logger.warning(f"get_balance error: {error_msg}")
+            raise RuntimeError(f"Failed to get balance: {error_msg}")
         return balances
     
     async def get_min_order(self, symbol: str, category: Category = Category.SPOT) -> Dict:
-        """Получить минимальный ордер"""
+        """Получить минимальный ордер и шаг количества"""
         resp = await self._api.request("GET", "/v5/market/instruments-info", {"category": category.value, "symbol": symbol}, signed=False)
         if resp.get("retCode") == 0:
             result = resp.get("result", {}).get("list", [])
@@ -281,7 +322,8 @@ class OrderQueue:
                 return {
                     "min_qty": lot.get("minOrderQty"),
                     "min_amt": lot.get("minOrderAmt"),
-                    "precision": lot.get("basePrecision")
+                    "precision": lot.get("basePrecision"),
+                    "qty_step": lot.get("qtyStep", "0.000001")  # Шаг для округления
                 }
         return {}
     
@@ -377,9 +419,8 @@ class OrderQueue:
                 return order_id
             
             min_info = await self.get_min_order(symbol)
-            precision = min_info.get("precision", "0.000001")
-            decimals = len(precision.split(".")[1].rstrip("0")) if "." in precision else 6
-            amount = f"{balance:.{decimals}f}"
+            qty_step = min_info.get("qty_step", "0.000001")
+            amount = truncate_to_step(balance, qty_step)
         
         order_type = OrderType.LIMIT if price else OrderType.MARKET
         
@@ -511,6 +552,18 @@ class OrderQueue:
         order.status = OrderStatus.PROCESSING
         logger.info(f"🔄 {order.id}: {order.side.value} {order.qty} {order.symbol}")
         
+        # Получаем шаг округления для символа и округляем qty
+        qty_to_send = order.qty
+        if order.market_unit != "quoteCoin":  # Не округляем если это сумма в USDT
+            try:
+                min_info = await self.get_min_order(order.symbol, order.category)
+                qty_step = min_info.get("qty_step", "0.000001")
+                qty_to_send = truncate_to_step(float(order.qty), qty_step)
+                if qty_to_send != order.qty:
+                    logger.info(f"📐 Округлено: {order.qty} → {qty_to_send} (шаг: {qty_step})")
+            except Exception as e:
+                logger.warning(f"Не удалось получить qty_step: {e}, используем оригинальное значение")
+        
         result = None
         for attempt in range(self.retry_count):
             try:
@@ -519,12 +572,13 @@ class OrderQueue:
                     "symbol": order.symbol,
                     "side": order.side.value,
                     "orderType": order.order_type.value,
-                    "qty": order.qty,
+                    "qty": qty_to_send,
                     "timeInForce": order.time_in_force.value
                 }
                 
                 if order.price:
                     params["price"] = order.price
+                    
                 if order.market_unit:
                     params["marketUnit"] = order.market_unit
                 
@@ -567,7 +621,7 @@ class OrderQueue:
                 await self.on_failed(order)
 
 
-# ==================== HELPERS ====================
+# ==================== FORMATTING ====================
 
 def format_order(order: QueuedOrder) -> str:
     """Форматировать ордер для вывода"""
