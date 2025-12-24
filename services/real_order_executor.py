@@ -214,9 +214,12 @@ class RealOrderExecutorService:
                     else:
                         return {"success": False, "error": "Could not get current price"}
             else:
+                # Use "all" for market sell orders to avoid insufficient balance errors
+                # (trading fees reduce actual balance vs stored entry_amount)
+                sell_amount = "all" if price_str is None else qty_str
                 order_id = await self._order_queue.sell(
                     symbol=symbol,
-                    amount=qty_str,
+                    amount=sell_amount,
                     price=price_str,
                 )
 

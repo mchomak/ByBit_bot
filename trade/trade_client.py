@@ -10,6 +10,7 @@ import hmac
 import hashlib
 import json
 import asyncio
+import math
 import aiohttp
 from typing import Optional, Dict, Any, List, Callable, Awaitable
 from dataclasses import dataclass, field
@@ -364,12 +365,12 @@ class OrderQueue:
             priority: Приоритет
             callback: Функция после выполнения
         """
-        # Если "all" - получаем баланс
+        # Если "all" - получаем баланс и продаем всё
         if amount.lower() == "all":
             base_coin = symbol.replace("USDT", "").replace("USDC", "")
             balances = await self.get_balance(base_coin)
-            balance = balances.get(base_coin, 0) * 0.99
-            
+            balance = balances.get(base_coin, 0)
+
             if balance == 0:
                 logger.error(f"Нет баланса {base_coin}")
                 order_id = f"q_{uuid.uuid4().hex[:8]}"
@@ -381,11 +382,17 @@ class OrderQueue:
                 )
                 self._orders[order_id] = order
                 return order_id
-            
+
+            # Get precision and round down to avoid "insufficient balance"
             min_info = await self.get_min_order(symbol)
             precision = min_info.get("precision", "0.000001")
             decimals = len(precision.split(".")[1].rstrip("0")) if "." in precision else 6
-            amount = f"{balance:.{decimals}f}"
+
+            # Round down (floor) to precision to avoid selling more than available
+            factor = 10 ** decimals
+            balance_floored = math.floor(balance * factor) / factor
+            amount = f"{balance_floored:.{decimals}f}"
+            logger.debug(f"Sell all {base_coin}: balance={balance}, floored={balance_floored}")
         
         order_type = OrderType.LIMIT if price else OrderType.MARKET
         
