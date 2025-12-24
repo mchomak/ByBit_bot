@@ -529,25 +529,12 @@ class TradingBot:
 
             await original_handle_entry(signal)
 
-            # Check if position was opened
+            # Check if position was opened (just log, notification sent by RealOrderExecutor)
             if signal.symbol in self._execution_engine._open_positions:
-                # Extract coin name from symbol (e.g., BTCUSDT -> BTC)
                 coin = signal.symbol.replace("USDT", "").replace("USDC", "")
-                current_time = datetime.now().strftime("%H:%M:%S")
-
-                # Calculate position size based on balance and risk
                 balance = await self._execution_engine._get_available_balance()
                 position_usdt = balance * self._execution_engine._risk_pct
-
-                # Use template from config
-                msg = settings.telegram_entry_template.format(
-                    symbol=coin,
-                    price=f"{signal.price:.6f}",
-                    position_size=f"{position_usdt:.2f}",
-                    time=current_time,
-                )
                 self._trading_log.info("ENTRY EXECUTED: {} @ {} | size={:.2f} USDT", coin, signal.price, position_usdt)
-                await self._notify(msg, notify_type="trade")
 
 
         async def logged_handle_exit(signal: TradingSignal) -> None:
@@ -567,28 +554,15 @@ class TradingBot:
 
             await original_handle_exit(signal)
 
-            # Check if position was closed
+            # Check if position was closed (notification sent by RealOrderExecutor)
             if signal.symbol not in self._execution_engine._open_positions and position:
                 exit_value = position.entry_amount * signal.price
                 profit_usdt = exit_value - position.entry_value_usdt
                 profit_pct = (profit_usdt / position.entry_value_usdt) * 100
 
-                # Extract coin name from symbol
                 coin = signal.symbol.replace("USDT", "").replace("USDC", "")
-                current_time = datetime.now().strftime("%H:%M:%S")
                 profit_sign = "+" if profit_pct >= 0 else ""
-
-                # Use template from config
-                msg = settings.telegram_exit_template.format(
-                    symbol=coin,
-                    exit_price=f"{signal.price:.6f}",
-                    exit_value=f"{exit_value:.2f}",
-                    profit_sign=profit_sign,
-                    profit_pct=f"{profit_pct:.1f}",
-                    time=current_time,
-                )
                 self._trading_log.info("EXIT EXECUTED: {} @ {} | P&L: {}{:.2f}%", coin, signal.price, profit_sign, profit_pct)
-                await self._notify(msg, notify_type="trade")
 
                 # Update user deposits based on trade profit
                 if self._telegram_bot and self._db:

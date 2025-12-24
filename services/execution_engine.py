@@ -350,11 +350,12 @@ class ExecutionEngine:
     async def _execute_buy(
         self, symbol: str, quantity: float, price: float, **context
     ) -> Dict[str, Any]:
-        """Execute a buy order with optional context for notifications."""
+        """Execute a market buy order with optional context for notifications."""
         if self._place_order:
             try:
+                # Use market order (price=None) for immediate execution
                 return await self._place_order(
-                    symbol, "Buy", quantity, price,
+                    symbol, "Buy", quantity, None,  # None = market order
                     signal_type="entry",
                     volume_ratio=context.get("volume_ratio"),
                     price_change_pct=context.get("price_change_pct"),
@@ -373,11 +374,12 @@ class ExecutionEngine:
     async def _execute_sell(
         self, symbol: str, quantity: float, price: float, **context
     ) -> Dict[str, Any]:
-        """Execute a sell order with optional context for notifications."""
+        """Execute a market sell order with optional context for notifications."""
         if self._place_order:
             try:
+                # Use market order (price=None) for immediate execution
                 return await self._place_order(
-                    symbol, "Sell", quantity, price,
+                    symbol, "Sell", quantity, None,  # None = market order
                     signal_type="exit",
                     position_id=context.get("position_id"),
                     entry_price=context.get("entry_price"),
