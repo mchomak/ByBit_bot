@@ -267,7 +267,7 @@ class Settings:
     def active_api_secret(self) -> str:
         """Get the active API secret based on bybit_demo."""
         if self.bybit_demo:
-            return self.bybit_demo_api_key
+            return self.bybit_demo_api_secret
         return self.bybit_api_secret
 
     @property

@@ -254,12 +254,16 @@ class OrderQueue:
         return None
     
     async def get_balance(self, coin: str = None) -> Dict[str, float]:
-        """Получить баланс (все монеты или конкретную)"""
+        """Получить баланс (все монеты или конкретную)
+
+        Raises:
+            RuntimeError: If API returns an error (enables Telegram notifications)
+        """
         params = {"accountType": "UNIFIED"}
         if coin:
             params["coin"] = coin
         resp = await self._api.request("GET", "/v5/account/wallet-balance", params)
-        
+
         balances = {}
         if resp.get("retCode") == 0:
             for acc in resp.get("result", {}).get("list", []):
@@ -268,7 +272,9 @@ class OrderQueue:
                     if bal > 0:
                         balances[c.get("coin")] = bal
         else:
-            logger.warning(f"get_balance error: {resp.get('retMsg', 'Unknown error')}")
+            error_msg = resp.get('retMsg', 'Unknown error')
+            logger.warning(f"get_balance error: {error_msg}")
+            raise RuntimeError(f"Failed to get balance: {error_msg}")
         return balances
     
     async def get_min_order(self, symbol: str, category: Category = Category.SPOT) -> Dict:
