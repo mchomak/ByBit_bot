@@ -343,30 +343,60 @@ class RealOrderExecutorService:
             if success:
                 if order.side.value == "Buy":
                     # Entry signal template
-                    # Extract coin name from symbol (e.g., BTCUSDT -> BTC)
                     coin = order.symbol.replace("USDT", "").replace("USDC", "")
-                    price = float(order.price) if order.price else context.get("price", 0)
-                    quantity = float(order.qty)
-                    position_size = quantity * price if price else 0
+
+                    # For market orders, order.price is None
+                    # Get price from context or try to estimate
+                    price = None
+                    if order.price:
+                        price = float(order.price)
+                    elif context.get("price"):
+                        price = float(context["price"])
+
+                    # For market buy with quoteCoin, order.qty is USDT amount
+                    # context["quantity"] has the token quantity
+                    token_qty = context.get("quantity", 0)
+                    usdt_amount = float(order.qty) if order.market_unit == "quoteCoin" else 0
+
+                    # Calculate position size
+                    if usdt_amount > 0:
+                        position_size = usdt_amount
+                    elif price and token_qty:
+                        position_size = token_qty * price
+                    else:
+                        position_size = 0
+
+                    # Get price for display (use approximate if market order)
+                    display_price = price if price else (position_size / token_qty if token_qty > 0 else 0)
 
                     msg = settings.telegram_entry_template.format(
                         symbol=coin,
-                        price=f"{price:.6f}",
+                        price=f"{display_price:.6f}" if display_price else "MARKET",
                         position_size=f"{position_size:.2f}",
                         time=current_time,
                     )
                 else:
                     # Exit signal template
                     coin = order.symbol.replace("USDT", "").replace("USDC", "")
-                    exit_price = float(order.price) if order.price else context.get("price", 0)
-                    quantity = float(order.qty)
-                    exit_value = quantity * exit_price if exit_price else 0
-                    pnl_pct = context.get("expected_pnl_pct", 0) or 0
+
+                    # For market sell, order.price is None
+                    exit_price = None
+                    if order.price:
+                        exit_price = float(order.price)
+                    elif context.get("price"):
+                        exit_price = float(context["price"])
+                    elif context.get("entry_price"):
+                        # Use entry price as estimate for display
+                        exit_price = float(context["entry_price"])
+
+                    quantity = float(order.qty) if order.qty else 0
+                    exit_value = quantity * exit_price if exit_price and quantity else 0
+                    pnl_pct = context.get("expected_pnl_pct") or 0
                     profit_sign = "+" if pnl_pct >= 0 else ""
 
                     msg = settings.telegram_exit_template.format(
                         symbol=coin,
-                        exit_price=f"{exit_price:.6f}",
+                        exit_price=f"{exit_price:.6f}" if exit_price else "MARKET",
                         exit_value=f"{exit_value:.2f}",
                         profit_sign=profit_sign,
                         profit_pct=f"{pnl_pct:.1f}",
