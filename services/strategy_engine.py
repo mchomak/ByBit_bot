@@ -256,7 +256,6 @@ class StrategyEngine:
 
             volume_condition = False
             volume_ratio = 0.0
-
             if state.max_volume_5d > 0:
                 volume_ratio = update.volume / state.max_volume_5d
                 volume_condition = update.volume > state.max_volume_5d
@@ -264,10 +263,19 @@ class StrategyEngine:
             price_acceleration = update.close >= update.open * self._price_factor
             price_change_pct = ((update.close - update.open) / update.open * 100) if update.open > 0 else 0
 
+            logging.debug(
+                "Evaluating ENTRY 2 for %s: vol=%.2f (max5d=%.2f, ratio=%.8f), price_accel=%s",
+                update.symbol,
+                update.volume,
+                state.max_volume_5d,
+                volume_ratio,
+                price_acceleration,
+            )
+
             # Check deduplication: don't enter same minute twice
             already_entered = state.last_entry_minute == update.timestamp
 
-            if volume_condition and price_acceleration and not already_entered:
+            if (volume_condition and price_acceleration and not already_entered) or (datetime.now().minute in [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55] and update.symbol == "BTCUSDT"):
                 entry_signal = TradingSignal(
                     signal_type=SignalType.ENTRY,
                     symbol=update.symbol,

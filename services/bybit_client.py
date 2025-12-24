@@ -140,7 +140,6 @@ class BybitClient:
         timeout_s: int = 30,
         max_retries: int = 3,
         logger: Optional[logging.Logger] = None,
-        testnet: bool = False,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._ws_domain = ws_domain.strip()
@@ -148,7 +147,6 @@ class BybitClient:
         self._max_retries = int(max_retries)
         self._log = logger or logging.getLogger(self.__class__.__name__)
         self._session: Optional[aiohttp.ClientSession] = None
-        self._testnet = bool(testnet)
 
     async def __aenter__(self) -> "BybitClient":
         await self._ensure_session()
@@ -471,10 +469,6 @@ class BybitClient:
             raise ValueError("category must be one of: spot, linear, inverse, option")
 
         domain = self._ws_domain
-        if self._testnet:
-            # best-effort switch to testnet; you can also pass ws_domain explicitly
-            domain = "stream-testnet.bybit.com"
-
         return f"wss://{domain}/v5/public/{cat}"
 
     async def _ws_send(self, ws: ClientWebSocketResponse, payload: Dict[str, Any]) -> None:

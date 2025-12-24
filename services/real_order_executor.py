@@ -41,7 +41,7 @@ class RealOrderExecutorService:
         order_model: Any,
         *,
         telegram_queue: Optional[asyncio.Queue] = None,
-        testnet: bool = False,
+        demo: bool = False,
         max_concurrent: int = 1,
         retry_count: int = 3,
         category: str = "spot",
@@ -55,7 +55,7 @@ class RealOrderExecutorService:
             session_factory: SQLAlchemy async session factory
             order_model: Order SQLAlchemy model
             telegram_queue: Optional queue for Telegram notifications
-            testnet: Use Bybit testnet if True
+            demo: Use Bybit demo if True
             max_concurrent: Maximum concurrent order executions
             retry_count: Number of retries for failed orders
             category: Bybit category (spot, linear, inverse)
@@ -69,7 +69,7 @@ class RealOrderExecutorService:
         self._order_queue = OrderQueue(
             api_key=api_key,
             api_secret=api_secret,
-            testnet=testnet,
+            demo=demo,
             max_concurrent=max_concurrent,
             retry_count=retry_count,
         )
@@ -100,7 +100,7 @@ class RealOrderExecutorService:
         await self._order_queue.start()
         self._running = True
 
-        mode = "TESTNET" if self._order_queue.testnet else "MAINNET"
+        mode = "TESTNET" if self._order_queue.demo else "MAINNET"
         self._log.info("Real order executor started ({} mode)", mode)
 
     async def stop(self) -> None:

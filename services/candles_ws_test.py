@@ -211,7 +211,6 @@ async def main() -> None:
     bybit_client = BybitClient(
         base_url=settings.bybit_rest_base_url,
         ws_domain=settings.bybit_ws_domain,
-        testnet=settings.bybit_testnet,
     )
 
     strategy_engine = StrategyEngine(

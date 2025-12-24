@@ -26,10 +26,19 @@ class Settings:
     # ==========================================================================
     # Bybit API (Trading / Private)
     # ==========================================================================
+    # TEST mode: uses demo for orders (real market data, test deposits)
+    # Set TEST=true for demo, TEST=false for production
+    # Production API keys (used when TEST=false)
     bybit_api_key: str = field(default_factory=lambda: os.getenv("BYBIT_API_KEY", ""))
     bybit_api_secret: str = field(default_factory=lambda: os.getenv("BYBIT_API_SECRET", ""))
-    bybit_testnet: bool = field(
-        default_factory=lambda: os.getenv("BYBIT_TESTNET", "false").lower() == "true"
+
+    # Demo API keys (used when TEST=true)
+    bybit_demo_api_key: str = field(default_factory=lambda: os.getenv("BYBIT_DEMO_API_KEY", ""))
+    bybit_demo_api_secret: str = field(default_factory=lambda: os.getenv("BYBIT_DEMO_API_SECRET", ""))
+
+    # Legacy DEMO flag (now derived from bybit_demo)
+    bybit_demo: bool = field(
+        default_factory=lambda: os.getenv("DEMO", "true").lower() == "true"
     )
 
     # ==========================================================================
@@ -191,13 +200,13 @@ class Settings:
 
         if not self.bybit_rest_base_url:
             self.bybit_rest_base_url = (
-                "https://api-testnet.bybit.com" if self.bybit_testnet
+                "https://api-testnet.bybit.com" if self.bybit_demo
                 else "https://api.bybit.com"
             )
 
         if not self.bybit_ws_domain:
             self.bybit_ws_domain = (
-                "stream-testnet.bybit.com" if self.bybit_testnet
+                "stream-testnet.bybit.com" if self.bybit_demo
                 else "stream.bybit.com"
             )
 
@@ -246,6 +255,25 @@ class Settings:
 
     def is_telegram_configured(self) -> bool:
         return bool(self.telegram_enabled and self.telegram_bot_token and self.telegram_chat_id)
+
+    @property
+    def active_api_key(self) -> str:
+        """Get the active API key based on bybit_demo."""
+        if self.bybit_demo:
+            return self.bybit_demo_api_key
+        return self.bybit_api_key
+
+    @property
+    def active_api_secret(self) -> str:
+        """Get the active API secret based on bybit_demo."""
+        if self.bybit_demo:
+            return self.bybit_demo_api_key
+        return self.bybit_api_secret
+
+    @property
+    def trading_mode(self) -> str:
+        """Get human-readable trading mode."""
+        return "TESTNET" if self.bybit_demo else "PRODUCTION"
 
 
 # Global settings instance

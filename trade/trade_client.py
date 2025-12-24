@@ -96,13 +96,13 @@ class _TradeApi:
     """Внутренний класс для работы с Bybit API"""
     
     MAINNET_URL = "https://api.bybit.com"
-    TESTNET_URL = "https://api-testnet.bybit.com"
+    DEMO_URL = "https://api-demo.bybit.com"
     
-    def __init__(self, api_key: str, api_secret: str, testnet: bool = False):
+    def __init__(self, api_key: str, api_secret: str, demo: bool = False):
         self.api_key = api_key
         self.api_secret = api_secret
-        self.base_url = self.TESTNET_URL if testnet else self.MAINNET_URL
-        self.testnet = testnet
+        self.base_url = self.DEMO_URL if demo else self.MAINNET_URL
+        self.demo = demo
         self.recv_window = 5000
         self._session: Optional[aiohttp.ClientSession] = None
     
@@ -145,14 +145,34 @@ class _TradeApi:
             session = await self._get_session()
             if method == "GET":
                 async with session.get(url, headers=headers, params=params, timeout=10) as resp:
-                    return await resp.json()
+                    result = await resp.json()
+                    if result is None:
+                        logger.warning(f"Empty response from {endpoint}")
+                        return {"retCode": -1, "retMsg": "Empty response"}
+                    if result.get("retCode") != 0:
+                        logger.debug(f"API error {endpoint}: {result.get('retMsg')}")
+                    return result
             else:
                 async with session.post(url, headers=headers, json=params, timeout=10) as resp:
-                    return await resp.json()
+                    result = await resp.json()
+                    if result is None:
+                        logger.warning(f"Empty response from {endpoint}")
+                        return {"retCode": -1, "retMsg": "Empty response"}
+                    if result.get("retCode") != 0:
+                        logger.debug(f"API error {endpoint}: {result.get('retMsg')}")
+                    return result
         except asyncio.TimeoutError:
+            logger.error(f"Timeout: {endpoint}")
             return {"retCode": -1, "retMsg": "Timeout"}
         except aiohttp.ClientError as e:
-            return {"retCode": -1, "retMsg": str(e)}
+            logger.error(f"ClientError {endpoint}: {e}")
+            return {"retCode": -1, "retMsg": f"ClientError: {e}"}
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON decode error {endpoint}: {e}")
+            return {"retCode": -1, "retMsg": f"JSON decode error: {e}"}
+        except Exception as e:
+            logger.error(f"Unexpected error {endpoint}: {type(e).__name__}: {e}")
+            return {"retCode": -1, "retMsg": f"Unexpected error: {type(e).__name__}: {e}"}
 
 
 # ==================== ORDER QUEUE ====================
@@ -162,7 +182,7 @@ class OrderQueue:
     Очередь ордеров для торгового бота
     
     Пример:
-        queue = OrderQueue(api_key, api_secret, testnet=False)
+        queue = OrderQueue(api_key, api_secret, demo=True)
         await queue.start()
         
         order_id = await queue.buy("BTCUSDT", "50")  # Покупка на $50
@@ -176,13 +196,13 @@ class OrderQueue:
         self,
         api_key: str,
         api_secret: str,
-        testnet: bool = False,
+        demo: bool = False,
         max_concurrent: int = 1,
         retry_count: int = 3,
         retry_delay: float = 1.0
     ):
-        self._api = _TradeApi(api_key, api_secret, testnet)
-        self.testnet = testnet
+        self._api = _TradeApi(api_key, api_secret, demo)
+        self.demo = demo
         self.max_concurrent = max_concurrent
         self.retry_count = retry_count
         self.retry_delay = retry_delay
@@ -196,7 +216,7 @@ class OrderQueue:
         self.on_completed: Optional[Callable[[QueuedOrder], Awaitable[None]]] = None
         self.on_failed: Optional[Callable[[QueuedOrder], Awaitable[None]]] = None
         
-        logger.info(f"OrderQueue: {'TESTNET' if testnet else 'MAINNET'}")
+        logger.info(f"OrderQueue: {'DEMO' if demo else 'MAINNET'}")
     
     # ==================== LIFECYCLE ====================
     
@@ -247,6 +267,8 @@ class OrderQueue:
                     bal = float(c.get("walletBalance", 0))
                     if bal > 0:
                         balances[c.get("coin")] = bal
+        else:
+            logger.warning(f"get_balance error: {resp.get('retMsg', 'Unknown error')}")
         return balances
     
     async def get_min_order(self, symbol: str, category: Category = Category.SPOT) -> Dict:

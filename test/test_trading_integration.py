@@ -149,7 +149,7 @@ class TradingIntegrationTest:
                 session_factory=self._db.session_factory,
                 order_model=Order,
                 telegram_queue=self._telegram_queue,
-                testnet=settings.bybit_testnet,
+                demo=settings.bybit_demo,
                 max_concurrent=1,
                 retry_count=2,
                 category=settings.bybit_category,

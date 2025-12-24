@@ -5,13 +5,16 @@ from trade_client import OrderQueue, OrderStatus, format_order
 # ║                         НАСТРОЙКИ                                ║
 # ╚══════════════════════════════════════════════════════════════════╝
 
-# Ваши API ключи (получите на https://testnet.bybit.com для тестов)
-API_KEY = "LBYHkDXl4eTUHQqldp"
-API_SECRET = "Ua0wo6oFPqWhdqcKVJNCaXAA0GIpLhr4Mzlr"
+# Ваши API ключи (создайте на bybit.com в режиме Demo Trading)
+# API_KEY = "LBYHkDXl4eTUHQqldp"
+# API_SECRET = "Ua0wo6oFPqWhdqcKVJNCaXAA0GIpLhr4Mzlr"
 
-# True = тестовая сеть (рекомендуется для начала!)
+API_KEY = "S77HXol52YNopygxMg"
+API_SECRET = "yFSwQOZX7wnVmSZMuMnvrYXLOmqejxzcahP3"
+
+# True = демо-торговля (виртуальные деньги, рекомендуется для начала!)
 # False = реальная торговля (ОСТОРОЖНО!)
-USE_TESTNET = False
+USE_DEMO = True
 
 
 # ╔══════════════════════════════════════════════════════════════════╗
@@ -24,7 +27,7 @@ async def test_info():
     print("ПРОВЕРКА ПОДКЛЮЧЕНИЯ")
     print("="*50)
     
-    queue = OrderQueue(API_KEY, API_SECRET, USE_TESTNET)
+    queue = OrderQueue(API_KEY, API_SECRET, USE_DEMO)
     
     try:
         # Цена
@@ -54,7 +57,7 @@ async def test_queue_interactive():
     print("ИНТЕРАКТИВНАЯ ОЧЕРЕДЬ")
     print("="*50)
     
-    queue = OrderQueue(API_KEY, API_SECRET, USE_TESTNET, retry_count=2)
+    queue = OrderQueue(API_KEY, API_SECRET, USE_DEMO, retry_count=2)
     
     # Callbacks
     async def on_done(order):
@@ -143,7 +146,7 @@ async def test_batch():
     print("ПАКЕТНЫЙ ТЕСТ")
     print("="*50)
     
-    queue = OrderQueue(API_KEY, API_SECRET, USE_TESTNET)
+    queue = OrderQueue(API_KEY, API_SECRET, USE_DEMO)
     
     results = []
     
@@ -197,7 +200,7 @@ from trade_client import OrderQueue, OrderStatus
 queue = OrderQueue(
     api_key="...",
     api_secret="...",
-    testnet=False,
+    demo=True,         # True = демо, False = реальная торговля
     max_concurrent=1,  # Один ордер за раз
     retry_count=3      # 3 попытки при ошибке
 )
@@ -281,7 +284,7 @@ async def main():
 ╔══════════════════════════════════════════════════════════════╗
 ║              BYBIT ORDER QUEUE - ТЕСТИРОВАНИЕ                ║
 ╠══════════════════════════════════════════════════════════════╣
-║  Режим: {' TESTNET' if USE_TESTNET else ' MAINNET'}     ║
+║  Режим: {'    DEMO' if USE_DEMO else ' MAINNET'}     ║
 ║  Установка: pip install aiohttp                              ║
 ╚══════════════════════════════════════════════════════════════╝
 """)

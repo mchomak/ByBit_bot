@@ -82,7 +82,7 @@ async def test_order_queue():
         queue = OrderQueue(
             api_key="test",
             api_secret="test",
-            testnet=True,
+            demo=True,
             max_concurrent=1,
         )
 
@@ -95,7 +95,7 @@ async def test_order_queue():
     queue = OrderQueue(
         api_key=settings.bybit_api_key,
         api_secret=settings.bybit_api_secret,
-        testnet=settings.bybit_testnet,
+        testnet=settings.bybit_demo,
         max_concurrent=1,
     )
 
@@ -185,7 +185,7 @@ async def test_real_order_executor():
             session_factory=db.session_factory,
             order_model=Order,
             telegram_queue=telegram_queue,
-            testnet=settings.bybit_testnet,
+            demo=settings.bybit_demo,
             max_concurrent=1,
             retry_count=2,
             category=settings.bybit_category,
