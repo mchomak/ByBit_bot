@@ -590,11 +590,11 @@ class TradingBot:
                 self._trading_log.info("EXIT EXECUTED: {} @ {} | P&L: {}{:.2f}%", coin, signal.price, profit_sign, profit_pct)
                 await self._notify(msg, notify_type="trade")
 
-                # Update user deposits based on new bot balance after sale
+                # Update user deposits based on trade profit
                 if self._telegram_bot and self._db:
                     try:
                         async with self._db.session_factory() as session:
-                            await self._telegram_bot.update_user_deposits_on_sale(session)
+                            await self._telegram_bot.update_user_deposits_on_trade(session, profit_pct)
                     except Exception as e:
                         self._trading_log.error("Failed to update user deposits: {}", e)
 
