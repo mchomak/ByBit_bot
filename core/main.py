@@ -36,9 +36,9 @@ from sqlalchemy.orm import sessionmaker
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from config.config import settings
 from core.bootstrap_logging import setup_logging
-from bot.TelegramNotifier import TelegramNotifier
+from bot.TelegramBot import TelegramBot
 from db.database import Database, CandleWriterService
-from db.models import Candle1m, Position, Order, Signal, Token
+from db.models import Candle1m, Position, Order, Signal, Token, User
 from db.repository import Repository
 from services.bybit_client import BybitClient
 from services.pipeline_events import PipelineMetrics, CandleUpdate, TradingSignal, SignalType
@@ -88,7 +88,7 @@ class TradingBot:
         self._execution_engine: Optional[ExecutionEngine] = None
         self._order_executor: Optional[RealOrderExecutorService] = None
         self._token_sync_service: Optional[TokenSyncService] = None
-        self._telegram_notifier: Optional[TelegramNotifier] = None
+        self._telegram_bot: Optional[TelegramBot] = None
 
         # Task handles
         self._ws_task: Optional[asyncio.Task] = None
@@ -194,8 +194,8 @@ class TradingBot:
         if self._token_sync_service:
             await self._token_sync_service.stop()
 
-        if self._telegram_notifier:
-            await self._telegram_notifier.stop()
+        if self._telegram_bot:
+            await self._telegram_bot.stop()
 
         if self._bybit_client:
             await self._bybit_client.close()
@@ -223,22 +223,31 @@ class TradingBot:
 
 
     async def _init_telegram(self) -> None:
-        """Initialize Telegram notifier if configured."""
+        """Initialize Telegram bot with commands if configured."""
         if not settings.is_telegram_configured():
             logger.info("Telegram notifications disabled (not configured)")
             return
 
-        logger.info("Initializing Telegram notifier...")
+        logger.info("Initializing Telegram bot...")
 
-        self._telegram_notifier = TelegramNotifier(
+        # Create get_balance function for deposit calculations
+        async def get_bot_balance() -> float:
+            if self._order_executor:
+                return await self._order_executor.get_balance("USDT")
+            return 0.0
+
+        self._telegram_bot = TelegramBot(
             token=settings.telegram_bot_token,
             chat_id=settings.telegram_chat_id,
             message_queue=self._telegram_queue,
+            session_factory=self._db.session_factory,
+            user_model=User,
+            get_bot_balance_fn=get_bot_balance,
             poll_interval=settings.telegram_rate_limit_s,
         )
-        await self._telegram_notifier.start()
+        await self._telegram_bot.start()
 
-        logger.info("Telegram notifier started")
+        logger.info("Telegram bot started with command support")
 
 
     async def _init_bybit_client(self) -> None:
@@ -415,16 +424,17 @@ class TradingBot:
         # Load historical data for strategy state (ALL symbols)
         logger.info("Loading candle history for %d symbols into strategy engine...", len(symbols))
         loaded_count = 0
-        for i, symbol in enumerate(symbols):
-            try:
-                candles = await self._candle_writer.get_recent_candles(symbol, limit=7200)
-                if candles:
-                    self._strategy_engine.load_historical_data(symbol, candles)
-                    loaded_count += 1
-                    if (i + 1) % 50 == 0:
-                        logger.info("Loaded history for %d/%d symbols...", i + 1, len(symbols))
-            except Exception as e:
-                logger.debug("Failed to load history for {}: {}", symbol, e)
+        # for i, symbol in enumerate(symbols):
+        #     try:
+        #         candles = await self._candle_writer.get_recent_candles(symbol, limit=7200)
+        #         if candles:
+        #             self._strategy_engine.load_historical_data(symbol, candles)
+        #             loaded_count += 1
+        #             if (i + 1) % 50 == 0:
+        #                 logger.info("Loaded history for %d/%d symbols...", i + 1, len(symbols))
+
+        #     except Exception as e:
+        #         logger.debug("Failed to load history for {}: {}", symbol, e)
 
         logger.info(
             "Strategy state initialized: %d/%d symbols with history (max_vol, MA14)",
@@ -580,6 +590,14 @@ class TradingBot:
                 )
                 self._trading_log.info("EXIT EXECUTED: {} @ {} | P&L: {}{:.2f}%", coin, signal.price, profit_sign, profit_pct)
                 await self._notify(msg, notify_type="trade")
+
+                # Update user deposits based on new bot balance after sale
+                if self._telegram_bot and self._db:
+                    try:
+                        async with self._db.session_factory() as session:
+                            await self._telegram_bot.update_user_deposits_on_sale(session)
+                    except Exception as e:
+                        self._trading_log.error("Failed to update user deposits: {}", e)
 
         self._execution_engine._handle_entry = logged_handle_entry
         self._execution_engine._handle_exit = logged_handle_exit

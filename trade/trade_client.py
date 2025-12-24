@@ -10,6 +10,7 @@ import hmac
 import hashlib
 import json
 import asyncio
+import math
 import aiohttp
 from typing import Optional, Dict, Any, List, Callable, Awaitable
 from dataclasses import dataclass, field
@@ -17,8 +18,6 @@ from enum import Enum
 from datetime import datetime
 import logging
 import uuid
-from decimal import Decimal, ROUND_DOWN
-import math
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -55,39 +54,6 @@ class OrderStatus(Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
-
-
-# ==================== HELPERS ====================
-
-def truncate_to_step(value: float, step: str) -> str:
-    """
-    Округлить значение вниз до шага (qtyStep от Bybit)
-    
-    Args:
-        value: Значение для округления (например, 0.05730141)
-        step: Шаг из API (например, "0.001" для BTC)
-    
-    Returns:
-        Округлённое значение как строка (например, "0.057")
-    
-    Examples:
-        truncate_to_step(0.05730141, "0.001") -> "0.057"
-        truncate_to_step(1.999, "0.01") -> "1.99"
-        truncate_to_step(123.456, "1") -> "123"
-    """
-    step_decimal = Decimal(step)
-    value_decimal = Decimal(str(value))
-    
-    # Округляем вниз до шага
-    truncated = (value_decimal / step_decimal).to_integral_value(rounding=ROUND_DOWN) * step_decimal
-    
-    # Определяем количество знаков после запятой из шага
-    if '.' in step:
-        decimals = len(step.rstrip('0').split('.')[1]) if step.rstrip('0').split('.')[1] else 0
-    else:
-        decimals = 0
-    
-    return f"{truncated:.{decimals}f}"
 
 
 # ==================== DATACLASSES ====================
@@ -313,7 +279,7 @@ class OrderQueue:
         return balances
     
     async def get_min_order(self, symbol: str, category: Category = Category.SPOT) -> Dict:
-        """Получить минимальный ордер и шаг количества"""
+        """Получить минимальный ордер"""
         resp = await self._api.request("GET", "/v5/market/instruments-info", {"category": category.value, "symbol": symbol}, signed=False)
         if resp.get("retCode") == 0:
             result = resp.get("result", {}).get("list", [])
@@ -322,8 +288,7 @@ class OrderQueue:
                 return {
                     "min_qty": lot.get("minOrderQty"),
                     "min_amt": lot.get("minOrderAmt"),
-                    "precision": lot.get("basePrecision"),
-                    "qty_step": lot.get("qtyStep", "0.000001")  # Шаг для округления
+                    "precision": lot.get("basePrecision")
                 }
         return {}
     
@@ -400,12 +365,12 @@ class OrderQueue:
             priority: Приоритет
             callback: Функция после выполнения
         """
-        # Если "all" - получаем баланс
+        # Если "all" - получаем баланс и продаем всё
         if amount.lower() == "all":
             base_coin = symbol.replace("USDT", "").replace("USDC", "")
             balances = await self.get_balance(base_coin)
-            balance = balances.get(base_coin, 0) * 0.99
-            
+            balance = balances.get(base_coin, 0)
+
             if balance == 0:
                 logger.error(f"Нет баланса {base_coin}")
                 order_id = f"q_{uuid.uuid4().hex[:8]}"
@@ -417,10 +382,17 @@ class OrderQueue:
                 )
                 self._orders[order_id] = order
                 return order_id
-            
+
+            # Get precision and round down to avoid "insufficient balance"
             min_info = await self.get_min_order(symbol)
-            qty_step = min_info.get("qty_step", "0.000001")
-            amount = truncate_to_step(balance, qty_step)
+            precision = min_info.get("precision", "0.000001")
+            decimals = len(precision.split(".")[1].rstrip("0")) if "." in precision else 6
+
+            # Round down (floor) to precision to avoid selling more than available
+            factor = 10 ** decimals
+            balance_floored = math.floor(balance * factor) / factor
+            amount = f"{balance_floored:.{decimals}f}"
+            logger.debug(f"Sell all {base_coin}: balance={balance}, floored={balance_floored}")
         
         order_type = OrderType.LIMIT if price else OrderType.MARKET
         
@@ -552,18 +524,6 @@ class OrderQueue:
         order.status = OrderStatus.PROCESSING
         logger.info(f"🔄 {order.id}: {order.side.value} {order.qty} {order.symbol}")
         
-        # Получаем шаг округления для символа и округляем qty
-        qty_to_send = order.qty
-        if order.market_unit != "quoteCoin":  # Не округляем если это сумма в USDT
-            try:
-                min_info = await self.get_min_order(order.symbol, order.category)
-                qty_step = min_info.get("qty_step", "0.000001")
-                qty_to_send = truncate_to_step(float(order.qty), qty_step)
-                if qty_to_send != order.qty:
-                    logger.info(f"📐 Округлено: {order.qty} → {qty_to_send} (шаг: {qty_step})")
-            except Exception as e:
-                logger.warning(f"Не удалось получить qty_step: {e}, используем оригинальное значение")
-        
         result = None
         for attempt in range(self.retry_count):
             try:
@@ -572,13 +532,12 @@ class OrderQueue:
                     "symbol": order.symbol,
                     "side": order.side.value,
                     "orderType": order.order_type.value,
-                    "qty": qty_to_send,
+                    "qty": order.qty,
                     "timeInForce": order.time_in_force.value
                 }
                 
                 if order.price:
                     params["price"] = order.price
-                    
                 if order.market_unit:
                     params["marketUnit"] = order.market_unit
                 
@@ -621,7 +580,7 @@ class OrderQueue:
                 await self.on_failed(order)
 
 
-# ==================== FORMATTING ====================
+# ==================== HELPERS ====================
 
 def format_order(order: QueuedOrder) -> str:
     """Форматировать ордер для вывода"""

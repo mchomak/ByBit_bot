@@ -212,7 +212,7 @@ class User(Base):
     """
     Telegram users who interact with the bot.
 
-    Stores user-specific settings like position limits.
+    Stores user-specific settings like position limits and deposit info.
     """
 
     __tablename__ = "users"
@@ -225,6 +225,10 @@ class User(Base):
     # User settings
     limit_positions = Column(Integer, default=5)  # Max simultaneous positions
     notifications_enabled = Column(Boolean, default=True)
+
+    # Deposit tracking
+    deposit = Column(Float, default=0.0)  # User's virtual deposit in USDT
+    deposit_percentage = Column(Float, default=0.0)  # Percentage of total bot deposit
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     last_active = Column(DateTime(timezone=True), server_default=func.now())
