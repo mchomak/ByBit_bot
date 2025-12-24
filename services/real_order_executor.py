@@ -18,7 +18,7 @@ import sys
 import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from trade.trade_client import OrderQueue, QueuedOrder, OrderStatus, Category
+from trade.trade_client import OrderQueue, QueuedOrder, OrderStatus, Category, truncate_to_step
 from config.config import settings
 
 
@@ -173,9 +173,18 @@ class RealOrderExecutorService:
         try:
             self._stats["orders_placed"] += 1
 
-            # Convert quantity to string for trade_client
-            qty_str = f"{quantity:.8f}".rstrip('0').rstrip('.')
+            # Get qty_step for proper truncation
+            min_info = await self._order_queue.get_min_order(symbol, self._category)
+            qty_step = min_info.get("qty_step", "0.000001")
+
+            # Convert quantity to string with proper precision
+            qty_str = truncate_to_step(quantity, qty_step)
             price_str = f"{price:.8f}".rstrip('0').rstrip('.') if price else None
+
+            self._log.debug(
+                "Order {} {}: qty={} -> truncated={} (step={})",
+                side, symbol, quantity, qty_str, qty_step
+            )
 
             # Prepare context for callbacks
             context = {
