@@ -10,14 +10,45 @@ import hmac
 import hashlib
 import json
 import asyncio
-import math
 import aiohttp
 from typing import Optional, Dict, Any, List, Callable, Awaitable
 from dataclasses import dataclass, field
 from enum import Enum
 from datetime import datetime
+from decimal import Decimal, ROUND_DOWN
 import logging
 import uuid
+
+
+def truncate_to_step(value: float, step: str) -> str:
+    """
+    Round the value down to a step (qtyStep from Bybit)
+
+    Args:
+        value: The value for rounding (e.g., 0.05730141)
+        step: A step from the API (e.g., "0.001" for BTC)
+
+    Returns:
+        Rounded value as a string (e.g., "0.057")
+
+    Examples:
+        truncate_to_step(0.05730141, "0.001") -> "0.057"
+        truncate_to_step(1.999, "0.01") -> "1.99"
+        truncate_to_step(123.456, "1") -> "123"
+    """
+    step_decimal = Decimal(step)
+    value_decimal = Decimal(str(value))
+
+    # Round down to a step
+    truncated = (value_decimal / step_decimal).to_integral_value(rounding=ROUND_DOWN) * step_decimal
+
+    # Determine the number of decimal places from the step
+    if '.' in step:
+        decimals = len(step.rstrip('0').split('.')[1]) if step.rstrip('0').split('.')[1] else 0
+    else:
+        decimals = 0
+
+    return f"{truncated:.{decimals}f}"
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -279,7 +310,7 @@ class OrderQueue:
         return balances
     
     async def get_min_order(self, symbol: str, category: Category = Category.SPOT) -> Dict:
-        """Получить минимальный ордер"""
+        """Получить минимальный ордер и шаг количества"""
         resp = await self._api.request("GET", "/v5/market/instruments-info", {"category": category.value, "symbol": symbol}, signed=False)
         if resp.get("retCode") == 0:
             result = resp.get("result", {}).get("list", [])
@@ -288,7 +319,8 @@ class OrderQueue:
                 return {
                     "min_qty": lot.get("minOrderQty"),
                     "min_amt": lot.get("minOrderAmt"),
-                    "precision": lot.get("basePrecision")
+                    "precision": lot.get("basePrecision"),
+                    "qty_step": lot.get("qtyStep", lot.get("basePrecision", "0.000001")),
                 }
         return {}
     
@@ -383,16 +415,13 @@ class OrderQueue:
                 self._orders[order_id] = order
                 return order_id
 
-            # Get precision and round down to avoid "insufficient balance"
+            # Get qty_step and truncate to proper precision
             min_info = await self.get_min_order(symbol)
-            precision = min_info.get("precision", "0.000001")
-            decimals = len(precision.split(".")[1].rstrip("0")) if "." in precision else 6
+            qty_step = min_info.get("qty_step", "0.000001")
 
-            # Round down (floor) to precision to avoid selling more than available
-            factor = 10 ** decimals
-            balance_floored = math.floor(balance * factor) / factor
-            amount = f"{balance_floored:.{decimals}f}"
-            logger.debug(f"Sell all {base_coin}: balance={balance}, floored={balance_floored}")
+            # Use truncate_to_step for proper decimal handling
+            amount = truncate_to_step(balance, qty_step)
+            logger.debug(f"Sell all {base_coin}: balance={balance}, truncated={amount}, step={qty_step}")
         
         order_type = OrderType.LIMIT if price else OrderType.MARKET
         

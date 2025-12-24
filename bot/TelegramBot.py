@@ -10,7 +10,7 @@ from aiogram.filters import Command
 from aiogram.types import Message
 from aiogram.exceptions import TelegramAPIError
 from loguru import logger
-from sqlalchemy import select, func as sql_func
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import sessionmaker
 
@@ -23,7 +23,7 @@ class TelegramBot:
         /start - Welcome message
         /help - List of commands
         /deposit - Add $1000 virtual deposit
-        /profile - View deposit balance
+        /profile - View deposit balance and profit
     """
 
     def __init__(
@@ -81,7 +81,7 @@ class TelegramBot:
         async def cmd_start(message: Message) -> None:
             """Handle /start command."""
             welcome_text = (
-                "<b>Welcome to the Trading Bot!</b>\n\n"
+                "<b>🤖 Welcome to the Trading Bot!</b>\n\n"
                 "This bot performs algorithmic trading on Bybit exchange.\n\n"
                 "Use /help to see available commands.\n\n"
                 "<i>Note: This is a demo trading bot for educational purposes.</i>"
@@ -93,14 +93,15 @@ class TelegramBot:
         async def cmd_help(message: Message) -> None:
             """Handle /help command."""
             help_text = (
-                "<b>Available Commands:</b>\n\n"
+                "<b>📋 Available Commands:</b>\n\n"
                 "/start - Welcome message and bot info\n"
                 "/help - Show this help message\n"
                 "/deposit - Add $1,000 virtual deposit to your account\n"
-                "/profile - View your current deposit balance\n\n"
-                "<b>How deposits work:</b>\n"
-                "When you deposit, your percentage of the total bot balance is recorded. "
-                "As the bot trades and the balance grows, your deposit grows proportionally."
+                "/profile - View your current deposit and profit\n\n"
+                "<b>How it works:</b>\n"
+                "When you deposit, you get a virtual balance. "
+                "When the bot closes trades, your deposit is updated "
+                "based on the trade's profit or loss percentage."
             )
             await message.answer(help_text)
 
@@ -111,11 +112,11 @@ class TelegramBot:
             username = message.from_user.username or message.from_user.first_name
 
             try:
-                # Get current bot balance
+                # Get current bot balance to check if deposit is possible
                 bot_balance = await self._get_current_bot_balance()
                 if bot_balance <= 0:
                     await message.answer(
-                        "Unable to process deposit: Bot balance unavailable.\n"
+                        "⚠️ Unable to process deposit: Bot balance unavailable.\n"
                         "Please try again later."
                     )
                     return
@@ -125,7 +126,7 @@ class TelegramBot:
                 # Check if deposit would exceed bot balance
                 if deposit_amount > bot_balance:
                     await message.answer(
-                        f"Deposit amount ${deposit_amount:.2f} exceeds "
+                        f"⚠️ Deposit amount ${deposit_amount:.2f} exceeds "
                         f"available bot balance ${bot_balance:.2f}.\n"
                         "Please try a smaller amount."
                     )
@@ -146,54 +147,44 @@ class TelegramBot:
                             telegram_id=telegram_id,
                             username=username,
                             deposit=0.0,
-                            deposit_percentage=0.0,
+                            total_profit=0.0,
                         )
                         session.add(user)
 
-                    # Calculate current deposit value based on percentage
-                    current_value = user.deposit_percentage * bot_balance / 100.0
-
-                    # Add new deposit
-                    new_total = current_value + deposit_amount
-                    new_percentage = (new_total / bot_balance) * 100.0
-
-                    # Update user
-                    user.deposit = new_total
-                    user.deposit_percentage = new_percentage
+                    # Add deposit to user's balance
+                    user.deposit += deposit_amount
                     user.last_active = datetime.utcnow()
                     if username:
                         user.username = username
 
                     await session.commit()
 
+                    new_total = user.deposit
+
                 await message.answer(
-                    f"<b>Deposit Successful!</b>\n\n"
+                    f"<b>✅ Deposit Successful!</b>\n\n"
                     f"Amount deposited: <b>${deposit_amount:.2f}</b>\n"
-                    f"Your total deposit: <b>${new_total:.2f}</b>\n"
-                    f"Your share: <b>{new_percentage:.4f}%</b> of total bot balance\n\n"
-                    f"<i>Your deposit will grow proportionally as the bot trades.</i>"
+                    f"Your total deposit: <b>${new_total:.2f}</b>\n\n"
+                    f"<i>Your deposit will grow/shrink based on trading results.</i>"
                 )
                 self.logger.info(
-                    "User {} deposited ${:.2f}, total: ${:.2f}, share: {:.4f}%",
-                    telegram_id, deposit_amount, new_total, new_percentage
+                    "User {} deposited ${:.2f}, total: ${:.2f}",
+                    telegram_id, deposit_amount, new_total
                 )
 
             except Exception as e:
                 self.logger.exception("Error processing deposit for user {}: {}", telegram_id, e)
                 await message.answer(
-                    "An error occurred while processing your deposit.\n"
+                    "❌ An error occurred while processing your deposit.\n"
                     "Please try again later."
                 )
 
         @self.router.message(Command("profile"))
         async def cmd_profile(message: Message) -> None:
-            """Handle /profile command - show user's deposit balance."""
+            """Handle /profile command - show user's deposit balance and profit."""
             telegram_id = message.from_user.id
 
             try:
-                # Get current bot balance
-                bot_balance = await self._get_current_bot_balance()
-
                 async with self._session_factory() as session:
                     result = await session.execute(
                         select(self._user_model).where(
@@ -202,30 +193,22 @@ class TelegramBot:
                     )
                     user = result.scalar_one_or_none()
 
-                    if user is None or user.deposit_percentage == 0:
+                    if user is None or user.deposit == 0:
                         await message.answer(
-                            "<b>Your Profile</b>\n\n"
+                            "<b>👤 Your Profile</b>\n\n"
                             "You haven't made any deposits yet.\n"
                             "Use /deposit to add $1,000 to your account."
                         )
                         return
 
-                    # Calculate current value based on percentage
-                    if bot_balance > 0:
-                        current_value = user.deposit_percentage * bot_balance / 100.0
-                    else:
-                        current_value = user.deposit  # Fallback to stored value
-
-                    # Calculate profit/loss
-                    initial_deposit = user.deposit  # This is updated on each deposit
-                    # For accurate P&L, we'd need to track initial deposit separately
-                    # For now, show current value
+                    # Format profit with sign
+                    profit_sign = "+" if user.total_profit >= 0 else ""
+                    profit_emoji = "📈" if user.total_profit >= 0 else "📉"
 
                     profile_text = (
-                        f"<b>Your Profile</b>\n\n"
-                        f"Current Balance: <b>${current_value:.2f}</b>\n"
-                        f"Your Share: <b>{user.deposit_percentage:.4f}%</b>\n"
-                        f"Bot Total Balance: <b>${bot_balance:.2f}</b>\n\n"
+                        f"<b>👤 Your Profile</b>\n\n"
+                        f"💰 Current Balance: <b>${user.deposit:.2f}</b>\n"
+                        f"{profit_emoji} Total Profit: <b>{profit_sign}{user.total_profit:.2f}%</b>\n\n"
                         f"<i>Last updated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC</i>"
                     )
                     await message.answer(profile_text)
@@ -237,7 +220,7 @@ class TelegramBot:
             except Exception as e:
                 self.logger.exception("Error fetching profile for user {}: {}", telegram_id, e)
                 await message.answer(
-                    "An error occurred while fetching your profile.\n"
+                    "❌ An error occurred while fetching your profile.\n"
                     "Please try again later."
                 )
 
@@ -329,35 +312,50 @@ class TelegramBot:
         await self.bot.session.close()
         self.logger.info("TelegramBot stopped")
 
-    async def update_user_deposits_on_sale(self, session: AsyncSession) -> None:
+    async def update_user_deposits_on_trade(
+        self,
+        session: AsyncSession,
+        profit_pct: float
+    ) -> None:
         """
-        Update all user deposits based on current bot balance.
+        Update all user deposits based on trade profit percentage.
         Call this after a successful token sale.
 
-        This recalculates each user's deposit value based on their
-        percentage share of the total bot balance.
+        Args:
+            session: Database session
+            profit_pct: Profit percentage from the trade (e.g., 20.0 for 20% profit)
+
+        Example:
+            If profit_pct = 20.0 and user has $1000 deposit:
+            - New deposit = $1000 * (1 + 20/100) = $1200
+            - total_profit is incremented by 20.0
         """
         try:
-            bot_balance = await self._get_current_bot_balance()
-            if bot_balance <= 0:
-                return
-
             # Get all users with deposits
             result = await session.execute(
                 select(self._user_model).where(
-                    self._user_model.deposit_percentage > 0
+                    self._user_model.deposit > 0
                 )
             )
             users = result.scalars().all()
 
+            if not users:
+                return
+
             for user in users:
-                # Update deposit value based on current percentage
-                user.deposit = user.deposit_percentage * bot_balance / 100.0
+                # Apply profit/loss percentage to deposit
+                multiplier = 1 + (profit_pct / 100.0)
+                user.deposit = user.deposit * multiplier
+
+                # Accumulate total profit percentage
+                # Note: This is additive for simplicity. For compound tracking,
+                # you would need: ((1 + old/100) * (1 + new/100) - 1) * 100
+                user.total_profit += profit_pct
 
             await session.commit()
             self.logger.info(
-                "Updated {} user deposits based on bot balance ${:.2f}",
-                len(users), bot_balance
+                "Updated {} user deposits with {:.2f}% profit",
+                len(users), profit_pct
             )
 
         except Exception as e:
