@@ -104,7 +104,6 @@ Thumbs.db
 
 # Old template files (to be removed)
 /core/
-/bot/
 /api/
 /ml/
 /tx_tools/
