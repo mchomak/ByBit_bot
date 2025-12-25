@@ -53,6 +53,10 @@ class Settings:
     bybit_ws_domain: str = field(
         default_factory=lambda: os.getenv("BYBIT_WS_DOMAIN", "").strip()
     )
+    # Use production market data even in demo mode (IMPORTANT for accurate prices/volumes)
+    use_production_marketdata: bool = field(
+        default_factory=lambda: os.getenv("USE_PRODUCTION_MARKETDATA", "true").lower() == "true"
+    )
 
     # HTTP client tuning
     bybit_http_timeout_s: int = field(
@@ -199,16 +203,26 @@ class Settings:
             raise ValueError("BYBIT_CATEGORY must be one of: spot, linear, inverse, option")
 
         if not self.bybit_rest_base_url:
-            self.bybit_rest_base_url = (
-                "https://api-testnet.bybit.com" if self.bybit_demo
-                else "https://api.bybit.com"
-            )
+            # CRITICAL: Use production REST API for market data even in demo mode
+            # Testnet has different prices and ~10x lower volumes which breaks trading signals
+            if self.use_production_marketdata:
+                self.bybit_rest_base_url = "https://api.bybit.com"
+            else:
+                self.bybit_rest_base_url = (
+                    "https://api-testnet.bybit.com" if self.bybit_demo
+                    else "https://api.bybit.com"
+                )
 
         if not self.bybit_ws_domain:
-            self.bybit_ws_domain = (
-                "stream-testnet.bybit.com" if self.bybit_demo
-                else "stream.bybit.com"
-            )
+            # CRITICAL: Use production WebSocket for market data even in demo mode
+            # Testnet has different prices and ~10x lower volumes which breaks trading signals
+            if self.use_production_marketdata:
+                self.bybit_ws_domain = "stream.bybit.com"
+            else:
+                self.bybit_ws_domain = (
+                    "stream-testnet.bybit.com" if self.bybit_demo
+                    else "stream.bybit.com"
+                )
 
         # Safety clamps
         self.bybit_http_timeout_s = max(5, int(self.bybit_http_timeout_s))
@@ -274,6 +288,18 @@ class Settings:
     def trading_mode(self) -> str:
         """Get human-readable trading mode."""
         return "TESTNET" if self.bybit_demo else "PRODUCTION"
+
+    @property
+    def bybit_trading_api_url(self) -> str:
+        """
+        Get the API URL for trading operations (orders, balance, etc.).
+
+        Uses testnet when in demo mode, production otherwise.
+        This is separate from market data URL which always uses production.
+        """
+        if self.bybit_demo:
+            return "https://api-demo.bybit.com"
+        return "https://api.bybit.com"
 
 
 # Global settings instance
