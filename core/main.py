@@ -122,7 +122,7 @@ class TradingBot:
 
             if not symbols:
                 logger.error("No symbols to trade. Check token sync configuration.")
-                await self._notify("No symbols to trade. Bot stopping.", notify_type="error")
+                await self._notify("Нет символов для торговли. Бот останавливается.", notify_type="error")
                 return
 
             # 5. Seed historical candles for strategy bootstrap
@@ -145,11 +145,11 @@ class TradingBot:
 
             # Notify successful start
             await self._notify(
-                f"Trading bot started\n"
-                f"Mode: {settings.trading_mode}\n"
-                f"Symbols: {len(symbols)}\n"
-                f"Max positions: {settings.max_positions}\n"
-                f"Risk per trade: {settings.risk_per_trade_pct}%",
+                f"Торговый бот запущен\n"
+                f"Режим: {settings.trading_mode}\n"
+                f"Символов: {len(symbols)}\n"
+                f"Макс. позиций: {settings.max_positions}\n"
+                f"Риск на сделку: {settings.risk_per_trade_pct}%",
                 notify_type="status"
             )
 
@@ -162,7 +162,7 @@ class TradingBot:
 
         except Exception as e:
             logger.critical("Fatal error during bot startup: {}", e)
-            await self._notify(f"Fatal startup error: {e}", notify_type="error")
+            await self._notify(f"Критическая ошибка запуска: {e}", notify_type="error")
             raise
         finally:
             await self.stop()
@@ -327,7 +327,7 @@ class TradingBot:
         count = await self._token_sync_service.sync_now()
         logger.info("Initial token sync completed: %d tokens", count)
 
-        await self._notify(f"Token sync: {count} tokens loaded", notify_type="sync")
+        await self._notify(f"Синхронизация токенов: загружено {count} токенов", notify_type="sync")
 
         # Reload tokens
         tokens = await self._repository.get_all(
@@ -473,8 +473,8 @@ class TradingBot:
                 "BYBIT_DEMO_API_KEY/SECRET" if settings.bybit_demo else "BYBIT_API_KEY/SECRET"
             )
             await self._notify(
-                f"⚠️ API keys not configured for {settings.trading_mode} mode!\n"
-                f"Bot will not place orders.",
+                f"⚠️ API ключи не настроены для режима {settings.trading_mode}!\n"
+                f"Бот не будет размещать ордера.",
                 notify_type="error"
             )
         else:
@@ -501,8 +501,8 @@ class TradingBot:
                 logger.info("DEMO MODE - Orders will be placed on Bybit demo")
                 logger.info("=" * 60)
                 await self._notify(
-                    "🟡 <b>DEMO MODE</b>\n"
-                    "Orders will be placed on Bybit demo (test funds)",
+                    "🟡 <b>ДЕМО РЕЖИМ</b>\n"
+                    "Ордера будут размещаться на Bybit демо (тестовые средства)",
                     notify_type="status"
                 )
             else:
@@ -510,8 +510,8 @@ class TradingBot:
                 logger.warning("PRODUCTION MODE - REAL ORDERS WILL BE PLACED")
                 logger.warning("=" * 60)
                 await self._notify(
-                    "🔴 <b>PRODUCTION MODE</b>\n"
-                    "Real orders will be placed on Bybit!",
+                    "🔴 <b>БОЕВОЙ РЕЖИМ</b>\n"
+                    "Реальные ордера будут размещаться на Bybit!",
                     notify_type="status"
                 )
 
@@ -671,10 +671,10 @@ class TradingBot:
                     try:
                         count = await self._token_sync_service.sync_now()
                         logger.info("Scheduled token sync completed: %d tokens", count)
-                        await self._notify(f"Token sync: {count} tokens synced", notify_type="sync")
+                        await self._notify(f"Синхронизация токенов: синхронизировано {count} токенов", notify_type="sync")
                     except Exception as e:
                         logger.error("Token sync failed: {}", e)
-                        await self._notify(f"Token sync failed: {e}", notify_type="error")
+                        await self._notify(f"Ошибка синхронизации токенов: {e}", notify_type="error")
 
             except asyncio.CancelledError:
                 break
@@ -786,7 +786,7 @@ async def main() -> None:
         logger.critical("Unhandled exception in main loop: {}", e)
         # Try to send error to Telegram
         try:
-            error_msg = f"<b>🔴 CRITICAL ERROR</b>\n\nBot crashed: {e}"
+            error_msg = f"<b>🔴 КРИТИЧЕСКАЯ ОШИБКА</b>\n\nБот упал: {e}"
             telegram_queue.put_nowait({"text": error_msg, "parse_mode": "HTML"})
             # Give a moment for the message to be sent
             await asyncio.sleep(2)
