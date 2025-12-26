@@ -209,7 +209,7 @@ async def example_usage():
     # Создаем и запускаем сервис
     service = TokenSyncService(
         repository=repository,
-        market_cap_threshold_usd=100_000_000,  # 100M USD
+        market_cap_threshold_usd=1_000_000,  # 100M USD
         bybit_categories=["linear", "spot"],
         symbol_aliases={"MATIC": "POL"},
         sync_interval_hours=6,  # Каждые 6 часов

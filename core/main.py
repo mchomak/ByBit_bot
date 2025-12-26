@@ -274,6 +274,16 @@ class TradingBot:
             settings.bybit_category,
             settings.bybit_demo
         )
+        logger.info(
+            "Market data: REST=%s, WS=%s",
+            settings.bybit_rest_base_url,
+            settings.bybit_ws_domain
+        )
+        if settings.use_production_marketdata and settings.bybit_demo:
+            logger.info(
+                "Using PRODUCTION market data with DEMO trading "
+                "(accurate prices/volumes, test funds for orders)"
+            )
 
 
     async def _init_tokens(self) -> List[str]:

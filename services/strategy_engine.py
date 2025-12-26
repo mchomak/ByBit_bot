@@ -275,7 +275,8 @@ class StrategyEngine:
             # Check deduplication: don't enter same minute twice
             already_entered = state.last_entry_minute == update.timestamp
 
-            if (volume_condition and price_acceleration and not already_entered) or (datetime.now().minute in [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55] and update.symbol == "BBSOLUSDT"):
+            if volume_condition and price_acceleration and not already_entered:
+            # if (volume_condition and price_acceleration and not already_entered) or (datetime.now().minute in [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55] and update.symbol == "BBSOLUSDT"):
                 entry_signal = TradingSignal(
                     signal_type=SignalType.ENTRY,
                     symbol=update.symbol,
