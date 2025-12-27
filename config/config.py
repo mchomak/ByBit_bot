@@ -174,13 +174,13 @@ class Settings:
     telegram_entry_template: str = field(
         default_factory=lambda: os.getenv(
             "TELEGRAM_ENTRY_TEMPLATE",
-            "🟢 Purchase\nCoin: {symbol}\nEntry price: {price}\nPosition Size: {position_size} USDT\nTime: {time}"
+            "🟢 Покупка\nМонета: {symbol}\nЦена входа: {price}\nРазмер позиции: {position_size} USDT\nВремя: {time}"
         )
     )
     telegram_exit_template: str = field(
         default_factory=lambda: os.getenv(
             "TELEGRAM_EXIT_TEMPLATE",
-            "🔴 Sale\nCoin: {symbol}\nExit Price: {exit_price}\nTotal withdrawal amount: {exit_value} USDT\nProfit: {profit_sign}{profit_pct}%\nTime: {time}"
+            "🔴 Продажа\nМонета: {symbol}\nЦена выхода: {exit_price}\nСумма вывода: {exit_value} USDT\nПрибыль: {profit_sign}{profit_pct}%\nВремя: {time}"
         )
     )
 

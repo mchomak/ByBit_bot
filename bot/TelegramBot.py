@@ -81,10 +81,10 @@ class TelegramBot:
         async def cmd_start(message: Message) -> None:
             """Handle /start command."""
             welcome_text = (
-                "<b>🤖 Welcome to the Trading Bot!</b>\n\n"
-                "This bot performs algorithmic trading on Bybit exchange.\n\n"
-                "Use /help to see available commands.\n\n"
-                "<i>Note: This is a demo trading bot for educational purposes.</i>"
+                "<b>🤖 Добро пожаловать в Торгового Бота!</b>\n\n"
+                "Этот бот выполняет алгоритмическую торговлю на бирже Bybit.\n\n"
+                "Используйте /help чтобы увидеть доступные команды.\n\n"
+                "<i>Примечание: Это демо торговый бот для образовательных целей.</i>"
             )
             await message.answer(welcome_text)
             self.logger.info("User {} started the bot", message.from_user.id)
@@ -93,15 +93,15 @@ class TelegramBot:
         async def cmd_help(message: Message) -> None:
             """Handle /help command."""
             help_text = (
-                "<b>📋 Available Commands:</b>\n\n"
-                "/start - Welcome message and bot info\n"
-                "/help - Show this help message\n"
-                "/deposit - Add $1,000 virtual deposit to your account\n"
-                "/profile - View your current deposit and profit\n\n"
-                "<b>How it works:</b>\n"
-                "When you deposit, you get a virtual balance. "
-                "When the bot closes trades, your deposit is updated "
-                "based on the trade's profit or loss percentage."
+                "<b>📋 Доступные команды:</b>\n\n"
+                "/start - Приветствие и информация о боте\n"
+                "/help - Показать это сообщение помощи\n"
+                "/deposit - Добавить $1,000 виртуального депозита\n"
+                "/profile - Посмотреть ваш депозит и прибыль\n\n"
+                "<b>Как это работает:</b>\n"
+                "При депозите вы получаете виртуальный баланс. "
+                "Когда бот закрывает сделки, ваш депозит обновляется "
+                "в соответствии с процентом прибыли или убытка."
             )
             await message.answer(help_text)
 
@@ -116,8 +116,8 @@ class TelegramBot:
                 bot_balance = await self._get_current_bot_balance()
                 if bot_balance <= 0:
                     await message.answer(
-                        "⚠️ Unable to process deposit: Bot balance unavailable.\n"
-                        "Please try again later."
+                        "⚠️ Невозможно обработать депозит: Баланс бота недоступен.\n"
+                        "Пожалуйста, попробуйте позже."
                     )
                     return
 
@@ -126,9 +126,9 @@ class TelegramBot:
                 # Check if deposit would exceed bot balance
                 if deposit_amount > bot_balance:
                     await message.answer(
-                        f"⚠️ Deposit amount ${deposit_amount:.2f} exceeds "
-                        f"available bot balance ${bot_balance:.2f}.\n"
-                        "Please try a smaller amount."
+                        f"⚠️ Сумма депозита ${deposit_amount:.2f} превышает "
+                        f"доступный баланс бота ${bot_balance:.2f}.\n"
+                        "Пожалуйста, попробуйте меньшую сумму."
                     )
                     return
 
@@ -162,10 +162,10 @@ class TelegramBot:
                     new_total = user.deposit
 
                 await message.answer(
-                    f"<b>✅ Deposit Successful!</b>\n\n"
-                    f"Amount deposited: <b>${deposit_amount:.2f}</b>\n"
-                    f"Your total deposit: <b>${new_total:.2f}</b>\n\n"
-                    f"<i>Your deposit will grow/shrink based on trading results.</i>"
+                    f"<b>✅ Депозит успешно внесён!</b>\n\n"
+                    f"Сумма депозита: <b>${deposit_amount:.2f}</b>\n"
+                    f"Ваш общий депозит: <b>${new_total:.2f}</b>\n\n"
+                    f"<i>Ваш депозит будет расти/уменьшаться в зависимости от результатов торговли.</i>"
                 )
                 self.logger.info(
                     "User {} deposited ${:.2f}, total: ${:.2f}",
@@ -175,8 +175,8 @@ class TelegramBot:
             except Exception as e:
                 self.logger.exception("Error processing deposit for user {}: {}", telegram_id, e)
                 await message.answer(
-                    "❌ An error occurred while processing your deposit.\n"
-                    "Please try again later."
+                    "❌ Произошла ошибка при обработке вашего депозита.\n"
+                    "Пожалуйста, попробуйте позже."
                 )
 
         @self.router.message(Command("profile"))
@@ -195,9 +195,9 @@ class TelegramBot:
 
                     if user is None or user.deposit == 0:
                         await message.answer(
-                            "<b>👤 Your Profile</b>\n\n"
-                            "You haven't made any deposits yet.\n"
-                            "Use /deposit to add $1,000 to your account."
+                            "<b>👤 Ваш профиль</b>\n\n"
+                            "Вы ещё не сделали ни одного депозита.\n"
+                            "Используйте /deposit чтобы добавить $1,000 на ваш счёт."
                         )
                         return
 
@@ -206,10 +206,10 @@ class TelegramBot:
                     profit_emoji = "📈" if user.total_profit >= 0 else "📉"
 
                     profile_text = (
-                        f"<b>👤 Your Profile</b>\n\n"
-                        f"💰 Current Balance: <b>${user.deposit:.2f}</b>\n"
-                        f"{profit_emoji} Total Profit: <b>{profit_sign}{user.total_profit:.2f}%</b>\n\n"
-                        f"<i>Last updated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC</i>"
+                        f"<b>👤 Ваш профиль</b>\n\n"
+                        f"💰 Текущий баланс: <b>${user.deposit:.2f}</b>\n"
+                        f"{profit_emoji} Общая прибыль: <b>{profit_sign}{user.total_profit:.2f}%</b>\n\n"
+                        f"<i>Обновлено: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC</i>"
                     )
                     await message.answer(profile_text)
 
@@ -220,8 +220,8 @@ class TelegramBot:
             except Exception as e:
                 self.logger.exception("Error fetching profile for user {}: {}", telegram_id, e)
                 await message.answer(
-                    "❌ An error occurred while fetching your profile.\n"
-                    "Please try again later."
+                    "❌ Произошла ошибка при получении вашего профиля.\n"
+                    "Пожалуйста, попробуйте позже."
                 )
 
     async def _get_current_bot_balance(self) -> float:

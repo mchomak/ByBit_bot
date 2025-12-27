@@ -157,7 +157,7 @@ class DailyReportService:
             # Send error notification
             try:
                 self._telegram_queue.put_nowait({
-                    "text": f"❌ Failed to generate daily report: {e}",
+                    "text": f"❌ Ошибка генерации ежедневного отчёта: {e}",
                     "parse_mode": "HTML"
                 })
             except:
@@ -289,24 +289,24 @@ class DailyReportService:
         win_rate = (profit_stats["winning_trades"] / total_trades * 100) if total_trades > 0 else 0
 
         report = (
-            f"<b>📊 Daily Report - {report_date}</b>\n"
+            f"<b>📊 Ежедневный отчёт - {report_date}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n\n"
 
-            f"<b>📦 Orders:</b>\n"
-            f"  • Total: <b>{order_stats['total']}</b>\n"
-            f"  • Buys: <b>{order_stats['buys']}</b>\n"
-            f"  • Sells: <b>{order_stats['sells']}</b>\n"
-            f"  • Filled: <b>{order_stats['filled']}</b>\n\n"
+            f"<b>📦 Ордера:</b>\n"
+            f"  • Всего: <b>{order_stats['total']}</b>\n"
+            f"  • Покупок: <b>{order_stats['buys']}</b>\n"
+            f"  • Продаж: <b>{order_stats['sells']}</b>\n"
+            f"  • Исполнено: <b>{order_stats['filled']}</b>\n\n"
 
-            f"<b>{profit_emoji} Profit:</b>\n"
-            f"  • Closed trades: <b>{profit_stats['closed_positions']}</b>\n"
-            f"  • Total P&L: <b>{profit_sign}${profit_stats['total_profit_usdt']:.2f}</b>\n"
-            f"  • Win/Loss: <b>{profit_stats['winning_trades']}/{profit_stats['losing_trades']}</b>\n"
-            f"  • Win Rate: <b>{win_rate:.1f}%</b>\n\n"
+            f"<b>{profit_emoji} Прибыль:</b>\n"
+            f"  • Закрытых сделок: <b>{profit_stats['closed_positions']}</b>\n"
+            f"  • Общий P&L: <b>{profit_sign}${profit_stats['total_profit_usdt']:.2f}</b>\n"
+            f"  • Выигрыш/Проигрыш: <b>{profit_stats['winning_trades']}/{profit_stats['losing_trades']}</b>\n"
+            f"  • Винрейт: <b>{win_rate:.1f}%</b>\n\n"
 
-            f"<b>🪙 Active Tokens:</b> <b>{active_tokens}</b>\n\n"
+            f"<b>🪙 Активных токенов:</b> <b>{active_tokens}</b>\n\n"
 
-            f"<i>Report generated at {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC</i>"
+            f"<i>Отчёт сформирован в {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC</i>"
         )
 
         return report

@@ -125,7 +125,7 @@ class RealOrderExecutorService:
             return balances.get(coin, 0.0)
         except Exception as e:
             self._log.error("Failed to get balance for {}: {}", coin, e)
-            await self._send_error_notification(f"Failed to get balance: {e}")
+            await self._send_error_notification(f"Ошибка получения баланса: {e}")
             return 0.0
 
     async def get_price(self, symbol: str) -> Optional[float]:
@@ -253,7 +253,7 @@ class RealOrderExecutorService:
 
         except Exception as e:
             self._log.exception("Error placing order: {}", e)
-            await self._send_error_notification(f"Order error for {symbol}: {e}")
+            await self._send_error_notification(f"Ошибка ордера для {symbol}: {e}")
             return {"success": False, "error": str(e)}
 
     async def _on_order_completed(self, order: QueuedOrder) -> None:
@@ -403,14 +403,14 @@ class RealOrderExecutorService:
                         time=current_time,
                     )
             else:
-                error_msg = order.result.message if order.result else "Unknown error"
+                error_msg = order.result.message if order.result else "Неизвестная ошибка"
                 msg = (
-                    f"❌ Order Failed\n\n"
-                    f"Symbol: {order.symbol}\n"
-                    f"Side: {order.side.value}\n"
-                    f"Quantity: {order.qty}\n"
-                    f"Error: {error_msg}\n"
-                    f"Time: {current_time}"
+                    f"❌ Ордер не выполнен\n\n"
+                    f"Символ: {order.symbol}\n"
+                    f"Сторона: {order.side.value}\n"
+                    f"Количество: {order.qty}\n"
+                    f"Ошибка: {error_msg}\n"
+                    f"Время: {current_time}"
                 )
 
             self._telegram_queue.put_nowait({"text": msg, "parse_mode": "HTML"})
@@ -426,7 +426,7 @@ class RealOrderExecutorService:
             return
 
         try:
-            msg = f"<b>⚠️ Trading Error</b>\n\n{error_msg}"
+            msg = f"<b>⚠️ Ошибка торговли</b>\n\n{error_msg}"
             self._telegram_queue.put_nowait({"text": msg, "parse_mode": "HTML"})
         except asyncio.QueueFull:
             self._log.warning("Telegram queue full, error notification dropped")
