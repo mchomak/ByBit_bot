@@ -268,11 +268,18 @@ class TelegramBot:
                         text = msg.get("text")
                         parse_mode = msg.get("parse_mode", "HTML")
                         chat_id = msg.get("chat_id", self.chat_id)
+                        broadcast = msg.get("broadcast", False)
+
+                        # Send to main chat
                         await self.bot.send_message(
                             chat_id=chat_id,
                             text=text,
                             parse_mode=parse_mode
                         )
+
+                        # Broadcast to all users if requested
+                        if broadcast:
+                            await self._broadcast_to_users(text, parse_mode)
                     else:
                         await self.bot.send_message(
                             chat_id=self.chat_id,
@@ -291,6 +298,63 @@ class TelegramBot:
             except Exception as e:
                 self.logger.error("Consumer error: {}", e)
                 await asyncio.sleep(1)
+
+    async def _broadcast_to_users(self, text: str, parse_mode: str = "HTML") -> None:
+        """
+        Send a message to all users with deposits.
+
+        Args:
+            text: Message text to send
+            parse_mode: Telegram parse mode (HTML, Markdown, etc.)
+        """
+        try:
+            async with self._session_factory() as session:
+                # Get all users with deposits (active investors)
+                result = await session.execute(
+                    select(self._user_model).where(
+                        self._user_model.deposit > 0
+                    )
+                )
+                users = result.scalars().all()
+
+                if not users:
+                    return
+
+                sent_count = 0
+                failed_count = 0
+
+                for user in users:
+                    try:
+                        # Don't send to main chat again (already sent)
+                        if str(user.telegram_id) == str(self.chat_id):
+                            continue
+
+                        await self.bot.send_message(
+                            chat_id=user.telegram_id,
+                            text=text,
+                            parse_mode=parse_mode
+                        )
+                        sent_count += 1
+
+                        # Small delay to avoid rate limiting
+                        await asyncio.sleep(0.1)
+
+                    except TelegramAPIError as e:
+                        # User may have blocked the bot or deleted account
+                        self.logger.warning(
+                            "Failed to send to user {}: {}",
+                            user.telegram_id, e
+                        )
+                        failed_count += 1
+
+                if sent_count > 0 or failed_count > 0:
+                    self.logger.info(
+                        "Broadcast complete: sent={}, failed={}",
+                        sent_count, failed_count
+                    )
+
+        except Exception as e:
+            self.logger.error("Broadcast error: {}", e)
 
     async def stop(self) -> None:
         """Stop the bot gracefully."""

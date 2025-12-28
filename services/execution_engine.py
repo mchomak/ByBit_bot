@@ -240,13 +240,22 @@ class ExecutionEngine:
             # Record entry
             self._entry_minutes.add(minute_key)
 
-            # Create position
+            # Use actual filled values from batch result
+            filled_qty = order_result.get("filled_qty", quantity)
+            avg_price = order_result.get("avg_price", signal.price)
+            actual_value = filled_qty * avg_price
+
+            # Get order IDs (may be multiple for split orders)
+            order_ids = order_result.get("order_ids", [])
+            order_id_str = ",".join(order_ids) if order_ids else order_result.get("order_id")
+
+            # Create position with actual filled values
             position_id = await self._create_position(
                 symbol=symbol,
-                entry_price=signal.price,
-                entry_amount=quantity,
-                entry_value=position_usdt,
-                order_id=order_result.get("order_id"),
+                entry_price=avg_price,  # Use average price from batch
+                entry_amount=filled_qty,  # Use actual filled quantity
+                entry_value=actual_value,
+                order_id=order_id_str,
             )
 
             if position_id:
@@ -259,10 +268,23 @@ class ExecutionEngine:
                 self._metrics.signals_executed += 1
                 await self._update_signal_execution(signal, True, None)
 
+                # Log with batch info
+                orders_info = ""
+                if order_result.get("orders_completed", 1) > 1:
+                    orders_info = f" ({order_result['orders_completed']} orders)"
+
                 self._log.info(
-                    "ENTRY executed: %s qty=%.6f value=%.2f USDT",
-                    symbol, quantity, position_usdt
+                    "ENTRY executed: %s qty=%.6f @ %.6f value=%.2f USDT%s",
+                    symbol, filled_qty, avg_price, actual_value, orders_info
                 )
+
+                # Log partial success if any orders failed
+                if order_result.get("partial"):
+                    self._log.warning(
+                        "ENTRY partial: %s failed_qty=%.6f errors=%s",
+                        symbol, order_result.get("failed_qty", 0),
+                        order_result.get("errors", [])
+                    )
         else:
             await self._update_signal_execution(
                 signal, False, order_result.get("error", "Order failed")
@@ -301,19 +323,33 @@ class ExecutionEngine:
         )
 
         if order_result.get("success"):
-            # Calculate P&L
-            exit_value = position.entry_amount * signal.price
-            profit_usdt = exit_value - position.entry_value_usdt
-            profit_pct = (profit_usdt / position.entry_value_usdt) * 100
+            # Use actual filled values from batch result
+            filled_qty = order_result.get("filled_qty", position.entry_amount)
+            avg_exit_price = order_result.get("avg_price", signal.price)
+
+            # Calculate P&L with actual values
+            exit_value = filled_qty * avg_exit_price
+            # Use proportional entry value if partial fill
+            if filled_qty < position.entry_amount:
+                proportional_entry_value = (filled_qty / position.entry_amount) * position.entry_value_usdt
+            else:
+                proportional_entry_value = position.entry_value_usdt
+
+            profit_usdt = exit_value - proportional_entry_value
+            profit_pct = (profit_usdt / proportional_entry_value) * 100 if proportional_entry_value > 0 else 0
+
+            # Get order IDs (may be multiple for split orders)
+            order_ids = order_result.get("order_ids", [])
+            order_id_str = ",".join(order_ids) if order_ids else order_result.get("order_id")
 
             # Close position
             await self._close_position(
                 position_id=position_id,
-                exit_price=signal.price,
-                exit_amount=position.entry_amount,
+                exit_price=avg_exit_price,  # Use average price from batch
+                exit_amount=filled_qty,  # Use actual filled quantity
                 exit_value=exit_value,
                 exit_reason="ma14_crossover",
-                order_id=order_result.get("order_id"),
+                order_id=order_id_str,
                 profit_usdt=profit_usdt,
                 profit_pct=profit_pct,
             )
@@ -328,10 +364,23 @@ class ExecutionEngine:
             self._metrics.signals_executed += 1
             await self._update_signal_execution(signal, True, None)
 
+            # Log with batch info
+            orders_info = ""
+            if order_result.get("orders_completed", 1) > 1:
+                orders_info = f" ({order_result['orders_completed']} orders)"
+
             self._log.info(
-                "EXIT executed: %s P&L=%.2f USDT (%.2f%%)",
-                symbol, profit_usdt, profit_pct
+                "EXIT executed: %s @ %.6f P&L=%.2f USDT (%.2f%%)%s",
+                symbol, avg_exit_price, profit_usdt, profit_pct, orders_info
             )
+
+            # Log partial success if any orders failed
+            if order_result.get("partial"):
+                self._log.warning(
+                    "EXIT partial: %s failed_qty=%.6f errors=%s",
+                    symbol, order_result.get("failed_qty", 0),
+                    order_result.get("errors", [])
+                )
         else:
             await self._update_signal_execution(
                 signal, False, order_result.get("error", "Order failed")
