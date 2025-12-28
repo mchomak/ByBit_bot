@@ -577,7 +577,13 @@ class RealOrderExecutorService:
                     f"Время: {current_time}"
                 )
 
-            self._telegram_queue.put_nowait({"text": msg, "parse_mode": "HTML"})
+            # Broadcast trade notifications to all users (not errors)
+            should_broadcast = batch.orders_completed > 0
+            self._telegram_queue.put_nowait({
+                "text": msg,
+                "parse_mode": "HTML",
+                "broadcast": should_broadcast
+            })
 
         except asyncio.QueueFull:
             self._log.warning("Telegram queue full, notification dropped")
