@@ -175,13 +175,13 @@ class Settings:
         default_factory=lambda: os.getenv(
             "TELEGRAM_ENTRY_TEMPLATE",
             "🟢 Покупка\nМонета: {symbol}\nЦена входа: {price}\nРазмер позиции: {position_size} USDT\nВремя: {time}"
-        )
+        ).replace("\\n", "\n")
     )
     telegram_exit_template: str = field(
         default_factory=lambda: os.getenv(
             "TELEGRAM_EXIT_TEMPLATE",
             "🔴 Продажа\nМонета: {symbol}\nЦена выхода: {exit_price}\nСумма вывода: {exit_value} USDT\nПрибыль: {profit_sign}{profit_pct}%\nВремя: {time}"
-        )
+        ).replace("\\n", "\n")
     )
 
     # ==========================================================================
