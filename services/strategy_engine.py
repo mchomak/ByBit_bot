@@ -5,7 +5,7 @@ Consumes CandleUpdate events, maintains per-symbol rolling statistics,
 evaluates entry/exit conditions, and emits signals.
 
 Strategy Rules:
-- ENTRY: volume > max_5d_volume AND close >= open * 3
+- ENTRY: volume > max_5d_volume OR close >= open * 3 (either condition triggers)
 - EXIT: price crosses MA14 from above (close <= ma14 OR low <= ma14)
 """
 
@@ -194,14 +194,18 @@ class StrategyEngine:
         # 3. Update rolling statistics only on confirmed candles
         # This ensures we don't double-count volume or use incomplete data
         if update.confirm:
+            # IMPORTANT: Capture max volume BEFORE adding current candle
+            # Otherwise we can never detect a new volume spike
+            previous_max_volume = state.max_volume_5d
+
             state.update_volume_history(update.timestamp, update.volume, self._volume_window)
             ma14 = state.update_ma14(update.close)
 
             # Sync position state
             state.has_open_position = symbol in self._open_positions
 
-            # 4. Evaluate conditions
-            signals = self._evaluate_conditions(update, state, ma14)
+            # 4. Evaluate conditions (using previous_max_volume for entry check)
+            signals = self._evaluate_conditions(update, state, ma14, previous_max_volume)
 
             # 5. Emit signals
             for signal in signals:
@@ -224,9 +228,17 @@ class StrategyEngine:
         update: CandleUpdate,
         state: SymbolState,
         ma14: Optional[float],
+        previous_max_volume: float = 0.0,
     ) -> List[TradingSignal]:
         """
         Evaluate entry and exit conditions.
+
+        Args:
+            update: Current candle update
+            state: Symbol state
+            ma14: Current MA14 value
+            previous_max_volume: Max volume from history BEFORE current candle was added
+                                 (used to detect volume spikes)
 
         Returns list of signals (0, 1, or 2 if both entry and exit somehow trigger).
         """
@@ -250,24 +262,27 @@ class StrategyEngine:
 
         # --- ENTRY CHECK ---
         if not state.has_open_position:
-            # Check entry conditions:
-            # 1. Volume spike: current volume > max 5-day volume
+            # Check entry conditions (OR logic - either triggers entry):
+            # 1. Volume spike: current volume > max 5-day volume (BEFORE this candle)
             # 2. Price acceleration: close >= open * 3
+            #
+            # IMPORTANT: We compare against previous_max_volume (history BEFORE current candle)
+            # because if we include current candle in max, a spike can never exceed itself!
 
             volume_condition = False
             volume_ratio = 0.0
-            if state.max_volume_5d > 0:
-                volume_ratio = update.volume / state.max_volume_5d
-                volume_condition = update.volume > state.max_volume_5d
+            if previous_max_volume > 0:
+                volume_ratio = update.volume / previous_max_volume
+                volume_condition = update.volume > previous_max_volume
 
             price_acceleration = update.close >= update.open * self._price_factor
             price_change_pct = ((update.close - update.open) / update.open * 100) if update.open > 0 else 0
 
             logging.debug(
-                "Evaluating ENTRY 2 for %s: vol=%.2f (max5d=%.2f, ratio=%.8f), price_accel=%s",
+                "Evaluating ENTRY for %s: vol=%.2f (prev_max5d=%.2f, ratio=%.8f), price_accel=%s",
                 update.symbol,
                 update.volume,
-                state.max_volume_5d,
+                previous_max_volume,
                 volume_ratio,
                 price_acceleration,
             )
@@ -275,8 +290,10 @@ class StrategyEngine:
             # Check deduplication: don't enter same minute twice
             already_entered = state.last_entry_minute == update.timestamp
 
-            if volume_condition and price_acceleration and not already_entered:
-            # if (volume_condition and price_acceleration and not already_entered) or (datetime.now().minute in [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55] and update.symbol == "BBSOLUSDT"):
+            # Entry condition: volume spike OR price acceleration (not both required)
+            entry_condition = (volume_condition or price_acceleration) and not already_entered
+
+            if entry_condition:
                 entry_signal = TradingSignal(
                     signal_type=SignalType.ENTRY,
                     symbol=update.symbol,
