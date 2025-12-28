@@ -3,13 +3,17 @@ Real Order Executor Service.
 
 Integrates the OrderQueue from trade_client.py with the trading pipeline.
 Executes real orders on Bybit, logs to database, and sends Telegram notifications.
+
+Supports order splitting when quantity exceeds exchange maxOrderQty limit.
 """
 
 from __future__ import annotations
 
 import asyncio
+import math
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Optional, Awaitable
+from typing import Any, Callable, Dict, List, Optional, Awaitable
 
 from loguru import logger
 from sqlalchemy.orm import sessionmaker
@@ -22,14 +26,30 @@ from trade.trade_client import OrderQueue, QueuedOrder, OrderStatus, Category, t
 from config.config import settings
 
 
+@dataclass
+class BatchOrderResult:
+    """Result of a batch order execution."""
+    success: bool
+    total_quantity: float = 0.0
+    filled_quantity: float = 0.0
+    failed_quantity: float = 0.0
+    avg_price: float = 0.0
+    order_ids: List[str] = field(default_factory=list)
+    orders_completed: int = 0
+    orders_failed: int = 0
+    errors: List[str] = field(default_factory=list)
+    first_order_time: Optional[datetime] = None
+
+
 class RealOrderExecutorService:
     """
     Real order executor that uses OrderQueue from trade_client.py.
 
     Features:
     - Executes real orders on Bybit via OrderQueue
-    - Sends Telegram notifications on order completion/failure
-    - Logs orders to database
+    - Splits large orders into multiple smaller ones when exceeding maxOrderQty
+    - Sends Telegram notifications only after all orders in batch complete
+    - Logs each order to database individually
     - Queues order execution for sequential processing
     """
 
@@ -74,9 +94,9 @@ class RealOrderExecutorService:
             retry_count=retry_count,
         )
 
-        # Set up callbacks
-        self._order_queue.on_completed = self._on_order_completed
-        self._order_queue.on_failed = self._on_order_failed
+        # Don't use callbacks - we handle notifications after batch completes
+        self._order_queue.on_completed = None
+        self._order_queue.on_failed = None
 
         # Pending order requests awaiting completion
         self._pending_requests: Dict[str, Dict[str, Any]] = {}
@@ -89,6 +109,7 @@ class RealOrderExecutorService:
             "orders_placed": 0,
             "orders_completed": 0,
             "orders_failed": 0,
+            "batches_executed": 0,
         }
 
     async def start(self) -> None:
@@ -112,10 +133,11 @@ class RealOrderExecutorService:
         self._running = False
 
         self._log.info(
-            "Real order executor stopped | placed={} completed={} failed={}",
+            "Real order executor stopped | placed={} completed={} failed={} batches={}",
             self._stats["orders_placed"],
             self._stats["orders_completed"],
             self._stats["orders_failed"],
+            self._stats["batches_executed"],
         )
 
     async def get_balance(self, coin: str = "USDT") -> float:
@@ -136,6 +158,49 @@ class RealOrderExecutorService:
             self._log.error("Failed to get price for {}: {}", symbol, e)
             return None
 
+    def _calculate_order_chunks(
+        self, total_quantity: float, max_qty: float, qty_step: str
+    ) -> List[float]:
+        """
+        Split total quantity into chunks not exceeding max_qty.
+
+        Distributes quantity evenly across minimum number of orders.
+        """
+        if total_quantity <= max_qty:
+            return [total_quantity]
+
+        # Calculate minimum number of orders needed
+        num_orders = math.ceil(total_quantity / max_qty)
+
+        # Distribute evenly
+        qty_per_order = total_quantity / num_orders
+
+        # Truncate each to step precision
+        chunks = []
+        remaining = total_quantity
+
+        for i in range(num_orders):
+            if i == num_orders - 1:
+                # Last chunk gets the remainder
+                chunk = remaining
+            else:
+                chunk = qty_per_order
+
+            # Truncate to step
+            chunk_str = truncate_to_step(chunk, qty_step)
+            chunk_val = float(chunk_str)
+
+            if chunk_val > 0:
+                chunks.append(chunk_val)
+                remaining -= chunk_val
+
+        self._log.info(
+            "Split order: total={} max_qty={} -> {} orders: {}",
+            total_quantity, max_qty, len(chunks), chunks
+        )
+
+        return chunks
+
     async def place_order(
         self,
         symbol: str,
@@ -152,7 +217,7 @@ class RealOrderExecutorService:
         price_change_pct: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
-        Place an order on Bybit.
+        Place an order on Bybit. Splits into multiple orders if quantity exceeds max.
 
         Args:
             symbol: Trading pair (e.g., "BTCUSDT")
@@ -171,33 +236,13 @@ class RealOrderExecutorService:
             Dict with success status and order details
         """
         try:
-            self._stats["orders_placed"] += 1
-
             # Get qty_step and max_qty for proper truncation and limits
             min_info = await self._order_queue.get_min_order(symbol, self._category)
             qty_step = min_info.get("qty_step", "0.000001")
             max_qty_str = min_info.get("max_qty")
             max_qty = float(max_qty_str) if max_qty_str else None
 
-            # Limit quantity to maxOrderQty if it exceeds the limit
-            original_qty = quantity
-            if max_qty and quantity > max_qty:
-                quantity = max_qty
-                self._log.warning(
-                    "Order {} {}: qty={} exceeds max_qty={}, limiting to max",
-                    side, symbol, original_qty, max_qty
-                )
-
-            # Convert quantity to string with proper precision
-            qty_str = truncate_to_step(quantity, qty_step)
-            price_str = f"{price:.8f}".rstrip('0').rstrip('.') if price else None
-
-            self._log.debug(
-                "Order {} {}: qty={} -> truncated={} (step={}, max={})",
-                side, symbol, original_qty, qty_str, qty_step, max_qty
-            )
-
-            # Prepare context for callbacks
+            # Context for notifications and DB
             context = {
                 "symbol": symbol,
                 "side": side,
@@ -213,108 +258,206 @@ class RealOrderExecutorService:
                 "timestamp": datetime.now(timezone.utc),
             }
 
-            # Place order via OrderQueue
-            if side.lower() == "buy":
-                # For market buy, use USDT amount (quantity * price)
-                if price:
-                    order_id = await self._order_queue.buy(
-                        symbol=symbol,
-                        amount=qty_str,
-                        price=price_str,
-                    )
-                else:
-                    # Market order - calculate USDT amount
-                    current_price = await self.get_price(symbol)
-                    if current_price:
-                        usdt_amount = quantity * current_price
-                        order_id = await self._order_queue.buy(
-                            symbol=symbol,
-                            amount=f"{usdt_amount:.2f}",
-                        )
-                    else:
-                        return {"success": False, "error": "Could not get current price"}
-            else:
-                # Use "all" for market sell orders to avoid insufficient balance errors
-                # (trading fees reduce actual balance vs stored entry_amount)
-                sell_amount = "all" if price_str is None else qty_str
-                order_id = await self._order_queue.sell(
-                    symbol=symbol,
-                    amount=sell_amount,
-                    price=price_str,
+            # Check if we need to split the order
+            if max_qty and quantity > max_qty:
+                self._log.info(
+                    "Order {} {}: qty={} exceeds max_qty={}, splitting...",
+                    side, symbol, quantity, max_qty
                 )
-
-            # Store context for callback
-            self._pending_requests[order_id] = context
-
-            # Wait for order completion
-            completed_order = await self._order_queue.wait(order_id, timeout=60)
-
-            if completed_order and completed_order.status == OrderStatus.COMPLETED:
-                return {
-                    "success": True,
-                    "order_id": completed_order.result.order_id if completed_order.result else order_id,
-                    "filled_qty": quantity,
-                    "filled_price": price,
-                }
-            elif completed_order and completed_order.status == OrderStatus.FAILED:
-                error_msg = completed_order.result.message if completed_order.result else "Unknown error"
-                return {"success": False, "error": error_msg}
+                chunks = self._calculate_order_chunks(quantity, max_qty, qty_step)
+                return await self._execute_batch_order(
+                    symbol, side, chunks, price, qty_step, context
+                )
             else:
-                return {"success": False, "error": "Order timeout or unknown status"}
+                # Single order
+                chunks = [quantity]
+                return await self._execute_batch_order(
+                    symbol, side, chunks, price, qty_step, context
+                )
 
         except Exception as e:
             self._log.exception("Error placing order: {}", e)
             await self._send_error_notification(f"Ошибка ордера для {symbol}: {e}")
             return {"success": False, "error": str(e)}
 
-    async def _on_order_completed(self, order: QueuedOrder) -> None:
-        """Callback when order is completed."""
-        self._stats["orders_completed"] += 1
+    async def _execute_batch_order(
+        self,
+        symbol: str,
+        side: str,
+        chunks: List[float],
+        price: Optional[float],
+        qty_step: str,
+        context: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Execute a batch of orders (possibly just one).
 
-        context = self._pending_requests.pop(order.id, {})
+        - Saves each order to DB individually
+        - Sends Telegram notification only after all complete
+        - Returns aggregated result
+        """
+        self._stats["batches_executed"] += 1
 
-        # Log to database
-        await self._save_order_to_db(order, context, success=True)
+        batch_result = BatchOrderResult(
+            success=False,
+            total_quantity=sum(chunks),
+            first_order_time=datetime.now(timezone.utc),
+        )
 
-        # Send Telegram notification
-        await self._send_order_notification(order, context, success=True)
+        price_str = f"{price:.8f}".rstrip('0').rstrip('.') if price else None
+
+        # For market orders, get current price for calculations
+        current_price = price
+        if not current_price:
+            current_price = await self.get_price(symbol)
+            if not current_price:
+                return {"success": False, "error": "Could not get current price"}
+
+        # Track prices for averaging
+        filled_prices: List[tuple] = []  # (quantity, price)
 
         self._log.info(
-            "Order completed: {} {} {} @ {}",
-            order.side.value,
-            order.qty,
-            order.symbol,
-            order.result.order_id if order.result else "N/A",
+            "Executing batch: {} {} {} in {} order(s)",
+            side, sum(chunks), symbol, len(chunks)
         )
 
-    async def _on_order_failed(self, order: QueuedOrder) -> None:
-        """Callback when order fails."""
-        self._stats["orders_failed"] += 1
+        for i, chunk_qty in enumerate(chunks):
+            self._stats["orders_placed"] += 1
 
-        context = self._pending_requests.pop(order.id, {})
+            qty_str = truncate_to_step(chunk_qty, qty_step)
 
-        # Log to database
-        await self._save_order_to_db(order, context, success=False)
+            self._log.debug(
+                "Batch order {}/{}: {} {} {} qty={}",
+                i + 1, len(chunks), side, symbol, qty_str, chunk_qty
+            )
 
-        # Send error notification
-        await self._send_order_notification(order, context, success=False)
+            try:
+                # Place order via OrderQueue
+                if side.lower() == "buy":
+                    if price:
+                        # Limit order
+                        order_id = await self._order_queue.buy(
+                            symbol=symbol,
+                            amount=qty_str,
+                            price=price_str,
+                        )
+                    else:
+                        # Market order - use USDT amount
+                        usdt_amount = chunk_qty * current_price
+                        order_id = await self._order_queue.buy(
+                            symbol=symbol,
+                            amount=f"{usdt_amount:.2f}",
+                        )
+                else:
+                    # Sell order
+                    if len(chunks) == 1 and price_str is None:
+                        # Single market sell - use "all" for convenience
+                        sell_amount = "all"
+                    else:
+                        sell_amount = qty_str
 
-        error_msg = order.result.message if order.result else "Unknown error"
-        self._log.error(
-            "Order failed: {} {} {} - {}",
-            order.side.value,
-            order.qty,
-            order.symbol,
-            error_msg,
+                    order_id = await self._order_queue.sell(
+                        symbol=symbol,
+                        amount=sell_amount,
+                        price=price_str,
+                    )
+
+                # Wait for order completion
+                completed_order = await self._order_queue.wait(order_id, timeout=60)
+
+                if completed_order and completed_order.status == OrderStatus.COMPLETED:
+                    self._stats["orders_completed"] += 1
+                    batch_result.orders_completed += 1
+                    batch_result.filled_quantity += chunk_qty
+                    batch_result.order_ids.append(
+                        completed_order.result.order_id if completed_order.result else order_id
+                    )
+
+                    # Track price for averaging
+                    fill_price = float(completed_order.price) if completed_order.price else current_price
+                    filled_prices.append((chunk_qty, fill_price))
+
+                    # Save order to DB
+                    await self._save_order_to_db(
+                        completed_order, context, success=True,
+                        position_id=context.get("position_id")
+                    )
+
+                    self._log.info(
+                        "Batch order {}/{} completed: {} {} {}",
+                        i + 1, len(chunks), side, qty_str, symbol
+                    )
+                else:
+                    self._stats["orders_failed"] += 1
+                    batch_result.orders_failed += 1
+                    batch_result.failed_quantity += chunk_qty
+
+                    error_msg = "Unknown error"
+                    if completed_order and completed_order.result:
+                        error_msg = completed_order.result.message
+                    batch_result.errors.append(f"Order {i+1}: {error_msg}")
+
+                    # Save failed order to DB
+                    if completed_order:
+                        await self._save_order_to_db(
+                            completed_order, context, success=False,
+                            position_id=context.get("position_id")
+                        )
+
+                    self._log.error(
+                        "Batch order {}/{} failed: {} {} {} - {}",
+                        i + 1, len(chunks), side, qty_str, symbol, error_msg
+                    )
+
+            except Exception as e:
+                self._stats["orders_failed"] += 1
+                batch_result.orders_failed += 1
+                batch_result.failed_quantity += chunk_qty
+                batch_result.errors.append(f"Order {i+1}: {str(e)}")
+                self._log.exception("Batch order {}/{} exception: {}", i + 1, len(chunks), e)
+
+        # Calculate average fill price
+        if filled_prices:
+            total_value = sum(qty * px for qty, px in filled_prices)
+            total_qty = sum(qty for qty, _ in filled_prices)
+            batch_result.avg_price = total_value / total_qty if total_qty > 0 else 0
+
+        # Determine overall success
+        batch_result.success = batch_result.orders_completed > 0
+
+        # Send consolidated Telegram notification
+        await self._send_batch_notification(batch_result, context)
+
+        # Log summary
+        self._log.info(
+            "Batch complete: {} {} {} | filled={}/{} | avg_price={:.6f} | orders={}/{}",
+            side, batch_result.filled_quantity, symbol,
+            batch_result.filled_quantity, batch_result.total_quantity,
+            batch_result.avg_price,
+            batch_result.orders_completed, len(chunks)
         )
+
+        return {
+            "success": batch_result.success,
+            "order_id": batch_result.order_ids[0] if batch_result.order_ids else None,
+            "order_ids": batch_result.order_ids,
+            "filled_qty": batch_result.filled_quantity,
+            "failed_qty": batch_result.failed_quantity,
+            "avg_price": batch_result.avg_price,
+            "orders_completed": batch_result.orders_completed,
+            "orders_failed": batch_result.orders_failed,
+            "errors": batch_result.errors,
+            "partial": batch_result.orders_failed > 0 and batch_result.orders_completed > 0,
+        }
 
     async def _save_order_to_db(
         self,
         order: QueuedOrder,
         context: Dict[str, Any],
         success: bool,
-    ) -> None:
-        """Save order to database."""
+        position_id: Optional[int] = None,
+    ) -> Optional[int]:
+        """Save order to database. Returns order ID."""
         try:
             from db.models import OrderSide as DBOrderSide, OrderStatus as DBOrderStatus
 
@@ -328,99 +471,109 @@ class RealOrderExecutorService:
                     quantity=float(order.qty),
                     filled_quantity=float(order.qty) if success else 0.0,
                     avg_fill_price=float(order.price) if order.price and success else None,
-                    position_id=context.get("position_id"),
+                    position_id=position_id,
                 )
                 session.add(db_order)
                 await session.commit()
+                await session.refresh(db_order)
+                return db_order.id
 
         except Exception as e:
             self._log.error("Failed to save order to database: {}", e)
+            return None
 
-    async def _send_order_notification(
+    async def _send_batch_notification(
         self,
-        order: QueuedOrder,
+        batch: BatchOrderResult,
         context: Dict[str, Any],
-        success: bool,
     ) -> None:
-        """Send Telegram notification for order using templates from config."""
+        """Send consolidated Telegram notification after batch completes."""
         if not self._telegram_queue:
             return
 
         try:
-            from datetime import datetime
-
             current_time = datetime.now().strftime("%H:%M:%S")
+            symbol = context.get("symbol", "")
+            side = context.get("side", "")
+            coin = symbol.replace("USDT", "").replace("USDC", "")
 
-            if success:
-                if order.side.value == "Buy":
-                    # Entry signal template
-                    coin = order.symbol.replace("USDT", "").replace("USDC", "")
+            # All orders successful
+            if batch.orders_failed == 0 and batch.orders_completed > 0:
+                if side.lower() == "buy":
+                    # Entry notification
+                    position_size = batch.filled_quantity * batch.avg_price
 
-                    # For market orders, order.price is None
-                    # Get price from context or try to estimate
-                    price = None
-                    if order.price:
-                        price = float(order.price)
-                    elif context.get("price"):
-                        price = float(context["price"])
-
-                    # For market buy with quoteCoin, order.qty is USDT amount
-                    # context["quantity"] has the token quantity
-                    token_qty = context.get("quantity", 0)
-                    usdt_amount = float(order.qty) if order.market_unit == "quoteCoin" else 0
-
-                    # Calculate position size
-                    if usdt_amount > 0:
-                        position_size = usdt_amount
-                    elif price and token_qty:
-                        position_size = token_qty * price
+                    if batch.orders_completed > 1:
+                        # Multiple orders
+                        msg = (
+                            f"🟢 <b>Вход в позицию</b>\n\n"
+                            f"Монета: <b>{coin}</b>\n"
+                            f"Цена: {batch.avg_price:.6f} (средняя)\n"
+                            f"Количество: {batch.filled_quantity:.4f}\n"
+                            f"Размер: ${position_size:.2f}\n"
+                            f"Ордеров: {batch.orders_completed}\n"
+                            f"Время: {current_time}"
+                        )
                     else:
-                        position_size = 0
-
-                    # Get price for display (use approximate if market order)
-                    display_price = price if price else (position_size / token_qty if token_qty > 0 else 0)
-
-                    msg = settings.telegram_entry_template.format(
-                        symbol=coin,
-                        price=f"{display_price:.6f}" if display_price else "MARKET",
-                        position_size=f"{position_size:.2f}",
-                        time=current_time,
-                    )
+                        msg = settings.telegram_entry_template.format(
+                            symbol=coin,
+                            price=f"{batch.avg_price:.6f}",
+                            position_size=f"{position_size:.2f}",
+                            time=current_time,
+                        )
                 else:
-                    # Exit signal template
-                    coin = order.symbol.replace("USDT", "").replace("USDC", "")
-
-                    # For market sell, order.price is None
-                    exit_price = None
-                    if order.price:
-                        exit_price = float(order.price)
-                    elif context.get("price"):
-                        exit_price = float(context["price"])
-                    elif context.get("entry_price"):
-                        # Use entry price as estimate for display
-                        exit_price = float(context["entry_price"])
-
-                    quantity = float(order.qty) if order.qty else 0
-                    exit_value = quantity * exit_price if exit_price and quantity else 0
+                    # Exit notification
+                    exit_value = batch.filled_quantity * batch.avg_price
                     pnl_pct = context.get("expected_pnl_pct") or 0
                     profit_sign = "+" if pnl_pct >= 0 else ""
 
-                    msg = settings.telegram_exit_template.format(
-                        symbol=coin,
-                        exit_price=f"{exit_price:.6f}" if exit_price else "MARKET",
-                        exit_value=f"{exit_value:.2f}",
-                        profit_sign=profit_sign,
-                        profit_pct=f"{pnl_pct:.1f}",
-                        time=current_time,
-                    )
-            else:
-                error_msg = order.result.message if order.result else "Неизвестная ошибка"
+                    if batch.orders_completed > 1:
+                        msg = (
+                            f"🔴 <b>Выход из позиции</b>\n\n"
+                            f"Монета: <b>{coin}</b>\n"
+                            f"Цена: {batch.avg_price:.6f} (средняя)\n"
+                            f"Количество: {batch.filled_quantity:.4f}\n"
+                            f"Сумма: ${exit_value:.2f}\n"
+                            f"Результат: {profit_sign}{pnl_pct:.1f}%\n"
+                            f"Ордеров: {batch.orders_completed}\n"
+                            f"Время: {current_time}"
+                        )
+                    else:
+                        msg = settings.telegram_exit_template.format(
+                            symbol=coin,
+                            exit_price=f"{batch.avg_price:.6f}",
+                            exit_value=f"{exit_value:.2f}",
+                            profit_sign=profit_sign,
+                            profit_pct=f"{pnl_pct:.1f}",
+                            time=current_time,
+                        )
+
+            # Partial success
+            elif batch.orders_completed > 0 and batch.orders_failed > 0:
+                action = "Покупка" if side.lower() == "buy" else "Продажа"
+                filled_value = batch.filled_quantity * batch.avg_price
+                failed_value = batch.failed_quantity * batch.avg_price
+
                 msg = (
-                    f"❌ Ордер не выполнен\n\n"
-                    f"Символ: {order.symbol}\n"
-                    f"Сторона: {order.side.value}\n"
-                    f"Количество: {order.qty}\n"
-                    f"Ошибка: {error_msg}\n"
+                    f"⚠️ <b>{action} выполнена частично</b>\n\n"
+                    f"Монета: <b>{coin}</b>\n"
+                    f"Выполнено: {batch.filled_quantity:.4f} (${filled_value:.2f})\n"
+                    f"Не выполнено: {batch.failed_quantity:.4f} (${failed_value:.2f})\n"
+                    f"Средняя цена: {batch.avg_price:.6f}\n"
+                    f"Ордеров: {batch.orders_completed}/{batch.orders_completed + batch.orders_failed}\n"
+                    f"Ошибки: {'; '.join(batch.errors[:2])}\n"
+                    f"Время: {current_time}"
+                )
+
+            # All failed
+            else:
+                action = "Покупка" if side.lower() == "buy" else "Продажа"
+                msg = (
+                    f"❌ <b>{action} не выполнена</b>\n\n"
+                    f"Монета: <b>{coin}</b>\n"
+                    f"Количество: {batch.total_quantity:.4f}\n"
+                    f"Ордеров: 0/{batch.orders_failed}\n"
+                    f"Ошибки: {'; '.join(batch.errors[:3])}\n"
                     f"Время: {current_time}"
                 )
 
@@ -429,7 +582,7 @@ class RealOrderExecutorService:
         except asyncio.QueueFull:
             self._log.warning("Telegram queue full, notification dropped")
         except Exception as e:
-            self._log.error("Failed to send order notification: {}", e)
+            self._log.error("Failed to send batch notification: {}", e)
 
     async def _send_error_notification(self, error_msg: str) -> None:
         """Send error notification to Telegram."""
