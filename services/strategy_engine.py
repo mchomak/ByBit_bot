@@ -5,7 +5,7 @@ Consumes CandleUpdate events, maintains per-symbol rolling statistics,
 evaluates entry/exit conditions, and emits signals.
 
 Strategy Rules:
-- ENTRY: volume > max_5d_volume AND close >= open * 3
+- ENTRY: volume > max_5d_volume OR close >= open * 3 (either condition triggers)
 - EXIT: price crosses MA14 from above (close <= ma14 OR low <= ma14)
 """
 
@@ -262,7 +262,7 @@ class StrategyEngine:
 
         # --- ENTRY CHECK ---
         if not state.has_open_position:
-            # Check entry conditions:
+            # Check entry conditions (OR logic - either triggers entry):
             # 1. Volume spike: current volume > max 5-day volume (BEFORE this candle)
             # 2. Price acceleration: close >= open * 3
             #
@@ -290,7 +290,10 @@ class StrategyEngine:
             # Check deduplication: don't enter same minute twice
             already_entered = state.last_entry_minute == update.timestamp
 
-            if (volume_condition and price_acceleration and not already_entered) or (datetime.now().minute in [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55] and update.symbol == "BTCUSDT"):
+            # Entry condition: volume spike OR price acceleration (not both required)
+            entry_condition = (volume_condition or price_acceleration) and not already_entered
+
+            if entry_condition:
                 entry_signal = TradingSignal(
                     signal_type=SignalType.ENTRY,
                     symbol=update.symbol,
