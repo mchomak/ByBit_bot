@@ -26,6 +26,53 @@ from trade.trade_client import OrderQueue, QueuedOrder, OrderStatus, Category, t
 from config.config import settings
 
 
+def format_price(price: float, min_significant: int = 3) -> str:
+    """
+    Format price with enough decimal places to show significant digits.
+
+    For very small prices (e.g., 0.000000345), shows all zeros plus
+    at least min_significant digits.
+
+    Args:
+        price: The price to format
+        min_significant: Minimum significant digits to show (default 3)
+
+    Returns:
+        Formatted price string
+
+    Examples:
+        format_price(25.81) -> "25.810000"
+        format_price(0.000000345) -> "0.000000345"
+        format_price(0.00000123) -> "0.00000123"
+    """
+    if price == 0:
+        return "0.000000"
+
+    if price >= 0.000001:
+        # For normal prices, use 6 decimal places
+        formatted = f"{price:.6f}"
+        # But check if all decimals are zeros after the dot
+        if float(formatted) == 0:
+            # Need more decimals
+            pass
+        else:
+            return formatted
+
+    # For very small prices, find how many decimals we need
+    # to show at least min_significant digits
+    abs_price = abs(price)
+
+    # Find the position of the first significant digit
+    if abs_price >= 1:
+        return f"{price:.6f}"
+
+    # Calculate decimals needed: -log10(price) + min_significant - 1
+    decimals_needed = int(-math.log10(abs_price)) + min_significant
+    decimals_needed = max(6, min(decimals_needed, 15))  # Clamp between 6 and 15
+
+    return f"{price:.{decimals_needed}f}"
+
+
 @dataclass
 class BatchOrderResult:
     """Result of a batch order execution."""
@@ -499,6 +546,8 @@ class RealOrderExecutorService:
 
             # All orders successful
             if batch.orders_failed == 0 and batch.orders_completed > 0:
+                price_formatted = format_price(batch.avg_price)
+
                 if side.lower() == "buy":
                     # Entry notification
                     position_size = batch.filled_quantity * batch.avg_price
@@ -508,7 +557,7 @@ class RealOrderExecutorService:
                         msg = (
                             f"🟢 <b>Вход в позицию</b>\n\n"
                             f"Монета: <b>{coin}</b>\n"
-                            f"Цена: {batch.avg_price:.6f} (средняя)\n"
+                            f"Цена: {price_formatted} (средняя)\n"
                             f"Количество: {batch.filled_quantity:.4f}\n"
                             f"Размер: ${position_size:.2f}\n"
                             f"Ордеров: {batch.orders_completed}\n"
@@ -517,7 +566,7 @@ class RealOrderExecutorService:
                     else:
                         msg = settings.telegram_entry_template.format(
                             symbol=coin,
-                            price=f"{batch.avg_price:.6f}",
+                            price=price_formatted,
                             position_size=f"{position_size:.2f}",
                             time=current_time,
                         )
@@ -531,7 +580,7 @@ class RealOrderExecutorService:
                         msg = (
                             f"🔴 <b>Выход из позиции</b>\n\n"
                             f"Монета: <b>{coin}</b>\n"
-                            f"Цена: {batch.avg_price:.6f} (средняя)\n"
+                            f"Цена: {price_formatted} (средняя)\n"
                             f"Количество: {batch.filled_quantity:.4f}\n"
                             f"Сумма: ${exit_value:.2f}\n"
                             f"Результат: {profit_sign}{pnl_pct:.1f}%\n"
@@ -541,7 +590,7 @@ class RealOrderExecutorService:
                     else:
                         msg = settings.telegram_exit_template.format(
                             symbol=coin,
-                            exit_price=f"{batch.avg_price:.6f}",
+                            exit_price=price_formatted,
                             exit_value=f"{exit_value:.2f}",
                             profit_sign=profit_sign,
                             profit_pct=f"{pnl_pct:.1f}",
@@ -553,13 +602,14 @@ class RealOrderExecutorService:
                 action = "Покупка" if side.lower() == "buy" else "Продажа"
                 filled_value = batch.filled_quantity * batch.avg_price
                 failed_value = batch.failed_quantity * batch.avg_price
+                price_formatted = format_price(batch.avg_price)
 
                 msg = (
                     f"⚠️ <b>{action} выполнена частично</b>\n\n"
                     f"Монета: <b>{coin}</b>\n"
                     f"Выполнено: {batch.filled_quantity:.4f} (${filled_value:.2f})\n"
                     f"Не выполнено: {batch.failed_quantity:.4f} (${failed_value:.2f})\n"
-                    f"Средняя цена: {batch.avg_price:.6f}\n"
+                    f"Средняя цена: {price_formatted}\n"
                     f"Ордеров: {batch.orders_completed}/{batch.orders_completed + batch.orders_failed}\n"
                     f"Ошибки: {'; '.join(batch.errors[:2])}\n"
                     f"Время: {current_time}"
