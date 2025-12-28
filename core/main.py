@@ -131,6 +131,15 @@ class TradingBot:
             # 6. Initialize pipeline components
             await self._init_pipeline(symbols)
 
+            # Notify that historical data is ready
+            await self._notify(
+                f"📊 Исторические данные загружены\n"
+                f"Токенов: {len(symbols)}\n"
+                f"Период: {settings.seed_days} дней\n"
+                f"Запуск получения live-данных...",
+                notify_type="status"
+            )
+
             # 7. Start WebSocket streaming
             await self._start_ws_streaming(symbols)
 
