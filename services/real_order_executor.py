@@ -173,17 +173,28 @@ class RealOrderExecutorService:
         try:
             self._stats["orders_placed"] += 1
 
-            # Get qty_step for proper truncation
+            # Get qty_step and max_qty for proper truncation and limits
             min_info = await self._order_queue.get_min_order(symbol, self._category)
             qty_step = min_info.get("qty_step", "0.000001")
+            max_qty_str = min_info.get("max_qty")
+            max_qty = float(max_qty_str) if max_qty_str else None
+
+            # Limit quantity to maxOrderQty if it exceeds the limit
+            original_qty = quantity
+            if max_qty and quantity > max_qty:
+                quantity = max_qty
+                self._log.warning(
+                    "Order {} {}: qty={} exceeds max_qty={}, limiting to max",
+                    side, symbol, original_qty, max_qty
+                )
 
             # Convert quantity to string with proper precision
             qty_str = truncate_to_step(quantity, qty_step)
             price_str = f"{price:.8f}".rstrip('0').rstrip('.') if price else None
 
             self._log.debug(
-                "Order {} {}: qty={} -> truncated={} (step={})",
-                side, symbol, quantity, qty_str, qty_step
+                "Order {} {}: qty={} -> truncated={} (step={}, max={})",
+                side, symbol, original_qty, qty_str, qty_step, max_qty
             )
 
             # Prepare context for callbacks

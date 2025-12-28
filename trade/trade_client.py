@@ -310,7 +310,7 @@ class OrderQueue:
         return balances
     
     async def get_min_order(self, symbol: str, category: Category = Category.SPOT) -> Dict:
-        """Получить минимальный ордер и шаг количества"""
+        """Получить минимальный/максимальный ордер и шаг количества"""
         resp = await self._api.request("GET", "/v5/market/instruments-info", {"category": category.value, "symbol": symbol}, signed=False)
         if resp.get("retCode") == 0:
             result = resp.get("result", {}).get("list", [])
@@ -318,6 +318,7 @@ class OrderQueue:
                 lot = result[0].get("lotSizeFilter", {})
                 return {
                     "min_qty": lot.get("minOrderQty"),
+                    "max_qty": lot.get("maxOrderQty"),  # Maximum quantity per order
                     "min_amt": lot.get("minOrderAmt"),
                     "precision": lot.get("basePrecision"),
                     "qty_step": lot.get("qtyStep", lot.get("basePrecision", "0.000001")),
@@ -415,13 +416,21 @@ class OrderQueue:
                 self._orders[order_id] = order
                 return order_id
 
-            # Get qty_step and truncate to proper precision
+            # Get qty_step and max_qty for proper precision and limits
             min_info = await self.get_min_order(symbol)
             qty_step = min_info.get("qty_step", "0.000001")
+            max_qty_str = min_info.get("max_qty")
+            max_qty = float(max_qty_str) if max_qty_str else None
+
+            # Limit to max_qty if balance exceeds limit
+            sell_qty = balance
+            if max_qty and balance > max_qty:
+                sell_qty = max_qty
+                logger.warning(f"Sell all {base_coin}: balance={balance} exceeds max_qty={max_qty}, limiting")
 
             # Use truncate_to_step for proper decimal handling
-            amount = truncate_to_step(balance, qty_step)
-            logger.debug(f"Sell all {base_coin}: balance={balance}, truncated={amount}, step={qty_step}")
+            amount = truncate_to_step(sell_qty, qty_step)
+            logger.debug(f"Sell all {base_coin}: balance={balance}, truncated={amount}, step={qty_step}, max={max_qty}")
         
         order_type = OrderType.LIMIT if price else OrderType.MARKET
         
