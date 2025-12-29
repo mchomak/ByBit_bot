@@ -228,7 +228,8 @@ class User(Base):
 
     # Deposit tracking
     deposit = Column(Float, default=0.0)  # User's virtual deposit in USDT
-    total_profit = Column(Float, default=0.0)  # Total accumulated profit percentage
+    share_pct = Column(Float, default=0.0)  # User's share of bot portfolio (%)
+    total_profit_usdt = Column(Float, default=0.0)  # Total accumulated profit in USDT
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     last_active = Column(DateTime(timezone=True), server_default=func.now())

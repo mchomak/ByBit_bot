@@ -310,7 +310,7 @@ class OrderQueue:
         return balances
     
     async def get_min_order(self, symbol: str, category: Category = Category.SPOT) -> Dict:
-        """Получить минимальный ордер и шаг количества"""
+        """Получить минимальный/максимальный ордер и шаг количества"""
         resp = await self._api.request("GET", "/v5/market/instruments-info", {"category": category.value, "symbol": symbol}, signed=False)
         if resp.get("retCode") == 0:
             result = resp.get("result", {}).get("list", [])
@@ -318,6 +318,7 @@ class OrderQueue:
                 lot = result[0].get("lotSizeFilter", {})
                 return {
                     "min_qty": lot.get("minOrderQty"),
+                    "max_qty": lot.get("maxOrderQty"),  # Maximum quantity per order
                     "min_amt": lot.get("minOrderAmt"),
                     "precision": lot.get("basePrecision"),
                     "qty_step": lot.get("qtyStep", lot.get("basePrecision", "0.000001")),
@@ -353,21 +354,26 @@ class OrderQueue:
         amount: str,
         price: str = None,
         priority: int = 0,
-        callback: Callable[[QueuedOrder], Awaitable[None]] = None
+        callback: Callable[[QueuedOrder], Awaitable[None]] = None,
+        use_quote_coin: bool = True,
     ) -> str:
         """
         Купить
-        
+
         Args:
             symbol: Пара (BTCUSDT)
-            amount: Сумма в USDT (для market) или количество (для limit)
+            amount: Сумма в USDT (для market с use_quote_coin=True) или количество токенов
             price: Цена (None = market order)
             priority: Приоритет (выше = раньше)
             callback: Функция после выполнения
+            use_quote_coin: Для market - True=сумма в USDT, False=количество токенов
         """
         order_type = OrderType.LIMIT if price else OrderType.MARKET
-        market_unit = "quoteCoin" if not price else None
-        
+        # For market orders: quoteCoin = USDT amount, baseCoin = token quantity
+        market_unit = None
+        if not price:  # Market order
+            market_unit = "quoteCoin" if use_quote_coin else "baseCoin"
+
         return await self._add_order(
             symbol=symbol,
             side=OrderSide.BUY,
@@ -415,13 +421,21 @@ class OrderQueue:
                 self._orders[order_id] = order
                 return order_id
 
-            # Get qty_step and truncate to proper precision
+            # Get qty_step and max_qty for proper precision and limits
             min_info = await self.get_min_order(symbol)
             qty_step = min_info.get("qty_step", "0.000001")
+            max_qty_str = min_info.get("max_qty")
+            max_qty = float(max_qty_str) if max_qty_str else None
+
+            # Limit to max_qty if balance exceeds limit
+            sell_qty = balance
+            if max_qty and balance > max_qty:
+                sell_qty = max_qty
+                logger.warning(f"Sell all {base_coin}: balance={balance} exceeds max_qty={max_qty}, limiting")
 
             # Use truncate_to_step for proper decimal handling
-            amount = truncate_to_step(balance, qty_step)
-            logger.debug(f"Sell all {base_coin}: balance={balance}, truncated={amount}, step={qty_step}")
+            amount = truncate_to_step(sell_qty, qty_step)
+            logger.debug(f"Sell all {base_coin}: balance={balance}, truncated={amount}, step={qty_step}, max={max_qty}")
         
         order_type = OrderType.LIMIT if price else OrderType.MARKET
         

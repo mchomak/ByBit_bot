@@ -112,7 +112,7 @@ class TelegramBot:
             username = message.from_user.username or message.from_user.first_name
 
             try:
-                # Get current bot balance to check if deposit is possible
+                # Get current bot total portfolio value (USDT + tokens)
                 bot_balance = await self._get_current_bot_balance()
                 if bot_balance <= 0:
                     await message.answer(
@@ -132,6 +132,9 @@ class TelegramBot:
                     )
                     return
 
+                # Calculate user's share of the portfolio
+                share_pct = (deposit_amount / bot_balance) * 100
+
                 async with self._session_factory() as session:
                     # Get or create user
                     result = await session.execute(
@@ -147,12 +150,14 @@ class TelegramBot:
                             telegram_id=telegram_id,
                             username=username,
                             deposit=0.0,
-                            total_profit=0.0,
+                            share_pct=0.0,
+                            total_profit_usdt=0.0,
                         )
                         session.add(user)
 
-                    # Add deposit to user's balance
+                    # Add deposit and share to user's balance
                     user.deposit += deposit_amount
+                    user.share_pct += share_pct  # Accumulate share
                     user.last_active = datetime.utcnow()
                     if username:
                         user.username = username
@@ -160,16 +165,18 @@ class TelegramBot:
                     await session.commit()
 
                     new_total = user.deposit
+                    total_share = user.share_pct
 
                 await message.answer(
                     f"<b>✅ Депозит успешно внесён!</b>\n\n"
                     f"Сумма депозита: <b>${deposit_amount:.2f}</b>\n"
-                    f"Ваш общий депозит: <b>${new_total:.2f}</b>\n\n"
-                    f"<i>Ваш депозит будет расти/уменьшаться в зависимости от результатов торговли.</i>"
+                    f"Ваш общий депозит: <b>${new_total:.2f}</b>\n"
+                    f"Ваша доля портфеля: <b>{total_share:.2f}%</b>\n\n"
+                    f"<i>Прибыль от сделок будет начисляться пропорционально вашей доле.</i>"
                 )
                 self.logger.info(
-                    "User {} deposited ${:.2f}, total: ${:.2f}",
-                    telegram_id, deposit_amount, new_total
+                    "User {} deposited ${:.2f}, total: ${:.2f}, share: {:.2f}%",
+                    telegram_id, deposit_amount, new_total, total_share
                 )
 
             except Exception as e:
@@ -201,14 +208,19 @@ class TelegramBot:
                         )
                         return
 
+                    # Get profit values (handle old records without new fields)
+                    total_profit_usdt = getattr(user, 'total_profit_usdt', 0.0) or 0.0
+                    share_pct = getattr(user, 'share_pct', 0.0) or 0.0
+
                     # Format profit with sign
-                    profit_sign = "+" if user.total_profit >= 0 else ""
-                    profit_emoji = "📈" if user.total_profit >= 0 else "📉"
+                    profit_sign = "+" if total_profit_usdt >= 0 else ""
+                    profit_emoji = "📈" if total_profit_usdt >= 0 else "📉"
 
                     profile_text = (
                         f"<b>👤 Ваш профиль</b>\n\n"
                         f"💰 Текущий баланс: <b>${user.deposit:.2f}</b>\n"
-                        f"{profit_emoji} Общая прибыль: <b>{profit_sign}{user.total_profit:.2f}%</b>\n\n"
+                        f"📊 Ваша доля портфеля: <b>{share_pct:.2f}%</b>\n"
+                        f"{profit_emoji} Общая прибыль: <b>{profit_sign}${total_profit_usdt:.2f}</b>\n\n"
                         f"<i>Обновлено: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC</i>"
                     )
                     await message.answer(profile_text)
@@ -379,26 +391,30 @@ class TelegramBot:
     async def update_user_deposits_on_trade(
         self,
         session: AsyncSession,
-        profit_pct: float
+        profit_usdt: float,
+        profit_pct: float = 0.0,
     ) -> None:
         """
-        Update all user deposits based on trade profit percentage.
-        Call this after a successful token sale.
+        Update all user deposits based on trade profit.
+        Distributes profit proportionally based on each user's share_pct.
 
         Args:
             session: Database session
-            profit_pct: Profit percentage from the trade (e.g., 20.0 for 20% profit)
+            profit_usdt: Profit amount in USDT from the trade (e.g., 500.0)
+            profit_pct: Profit percentage (for logging, optional)
 
         Example:
-            If profit_pct = 20.0 and user has $1000 deposit:
-            - New deposit = $1000 * (1 + 20/100) = $1200
-            - total_profit is incremented by 20.0
+            Bot makes trade with $500 profit.
+            User has 2% share (share_pct = 2.0):
+            - User gets: $500 * 0.02 = $10
+            - user.deposit += $10
+            - user.total_profit_usdt += $10
         """
         try:
-            # Get all users with deposits
+            # Get all users with shares
             result = await session.execute(
                 select(self._user_model).where(
-                    self._user_model.deposit > 0
+                    self._user_model.share_pct > 0
                 )
             )
             users = result.scalars().all()
@@ -406,20 +422,25 @@ class TelegramBot:
             if not users:
                 return
 
+            total_distributed = 0.0
             for user in users:
-                # Apply profit/loss percentage to deposit
-                multiplier = 1 + (profit_pct / 100.0)
-                user.deposit = user.deposit * multiplier
+                # Calculate user's share of profit
+                share_pct = getattr(user, 'share_pct', 0.0) or 0.0
+                user_profit = profit_usdt * (share_pct / 100.0)
 
-                # Accumulate total profit percentage
-                # Note: This is additive for simplicity. For compound tracking,
-                # you would need: ((1 + old/100) * (1 + new/100) - 1) * 100
-                user.total_profit += profit_pct
+                # Add profit to deposit
+                user.deposit += user_profit
+
+                # Track total profit in USDT
+                if hasattr(user, 'total_profit_usdt'):
+                    user.total_profit_usdt = (user.total_profit_usdt or 0.0) + user_profit
+
+                total_distributed += user_profit
 
             await session.commit()
             self.logger.info(
-                "Updated {} user deposits with {:.2f}% profit",
-                len(users), profit_pct
+                "Distributed ${:.2f} profit to {} users (total trade profit: ${:.2f}, {:.2f}%)",
+                total_distributed, len(users), profit_usdt, profit_pct
             )
 
         except Exception as e:

@@ -591,11 +591,15 @@ class TradingBot:
                 profit_sign = "+" if profit_pct >= 0 else ""
                 self._trading_log.info("EXIT EXECUTED: {} @ {} | P&L: {}{:.2f}%", coin, signal.price, profit_sign, profit_pct)
 
-                # Update user deposits based on trade profit
+                # Update user deposits based on trade profit (proportional to share)
                 if self._telegram_bot and self._db:
                     try:
                         async with self._db.session_factory() as session:
-                            await self._telegram_bot.update_user_deposits_on_trade(session, profit_pct)
+                            await self._telegram_bot.update_user_deposits_on_trade(
+                                session,
+                                profit_usdt=profit_usdt,
+                                profit_pct=profit_pct
+                            )
                     except Exception as e:
                         self._trading_log.error("Failed to update user deposits: {}", e)
 

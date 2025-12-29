@@ -289,6 +289,18 @@ class RealOrderExecutorService:
             max_qty_str = min_info.get("max_qty")
             max_qty = float(max_qty_str) if max_qty_str else None
 
+            self._log.debug(
+                "Order limits for {}: qty_step={}, max_qty={}, min_info={}",
+                symbol, qty_step, max_qty, min_info
+            )
+
+            # Warn if we couldn't get max_qty - orders might fail
+            if max_qty is None:
+                self._log.warning(
+                    "Could not get max_qty for {} - order splitting disabled! min_info={}",
+                    symbol, min_info
+                )
+
             # Context for notifications and DB
             context = {
                 "symbol": symbol,
@@ -382,18 +394,19 @@ class RealOrderExecutorService:
                 # Place order via OrderQueue
                 if side.lower() == "buy":
                     if price:
-                        # Limit order
+                        # Limit order - use token quantity
                         order_id = await self._order_queue.buy(
                             symbol=symbol,
                             amount=qty_str,
                             price=price_str,
                         )
                     else:
-                        # Market order - use USDT amount
-                        usdt_amount = chunk_qty * current_price
+                        # Market order - use token quantity (baseCoin) for precise control
+                        # This ensures we don't exceed maxOrderQty due to price fluctuation
                         order_id = await self._order_queue.buy(
                             symbol=symbol,
-                            amount=f"{usdt_amount:.2f}",
+                            amount=qty_str,
+                            use_quote_coin=False,  # Use baseCoin = exact token quantity
                         )
                 else:
                     # Sell order
