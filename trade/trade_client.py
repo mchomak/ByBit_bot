@@ -354,21 +354,26 @@ class OrderQueue:
         amount: str,
         price: str = None,
         priority: int = 0,
-        callback: Callable[[QueuedOrder], Awaitable[None]] = None
+        callback: Callable[[QueuedOrder], Awaitable[None]] = None,
+        use_quote_coin: bool = True,
     ) -> str:
         """
         Купить
-        
+
         Args:
             symbol: Пара (BTCUSDT)
-            amount: Сумма в USDT (для market) или количество (для limit)
+            amount: Сумма в USDT (для market с use_quote_coin=True) или количество токенов
             price: Цена (None = market order)
             priority: Приоритет (выше = раньше)
             callback: Функция после выполнения
+            use_quote_coin: Для market - True=сумма в USDT, False=количество токенов
         """
         order_type = OrderType.LIMIT if price else OrderType.MARKET
-        market_unit = "quoteCoin" if not price else None
-        
+        # For market orders: quoteCoin = USDT amount, baseCoin = token quantity
+        market_unit = None
+        if not price:  # Market order
+            market_unit = "quoteCoin" if use_quote_coin else "baseCoin"
+
         return await self._add_order(
             symbol=symbol,
             side=OrderSide.BUY,
