@@ -286,19 +286,34 @@ class RealOrderExecutorService:
             # Get qty_step and max_qty for proper truncation and limits
             min_info = await self._order_queue.get_min_order(symbol, self._category)
             qty_step = min_info.get("qty_step", "0.000001")
-            max_qty_str = min_info.get("max_qty")
-            max_qty = float(max_qty_str) if max_qty_str else None
+
+            # IMPORTANT: Bybit has DIFFERENT limits for market vs limit orders!
+            # - maxOrderQty: Maximum for LIMIT orders
+            # - maxMktOrderQty: Maximum for MARKET orders (usually lower)
+            max_limit_qty_str = min_info.get("max_qty")  # For limit orders
+            max_mkt_qty_str = min_info.get("max_mkt_qty")  # For market orders
+
+            max_limit_qty = float(max_limit_qty_str) if max_limit_qty_str else None
+            max_mkt_qty = float(max_mkt_qty_str) if max_mkt_qty_str else None
+
+            # Choose the correct limit based on order type
+            is_market_order = price is None
+            if is_market_order:
+                max_qty = max_mkt_qty  # Use market order limit
+            else:
+                max_qty = max_limit_qty  # Use limit order limit
 
             self._log.debug(
-                "Order limits for {}: qty_step={}, max_qty={}, min_info={}",
-                symbol, qty_step, max_qty, min_info
+                "Order limits for {}: qty_step={}, max_limit_qty={}, max_mkt_qty={}, using={} ({})",
+                symbol, qty_step, max_limit_qty, max_mkt_qty, max_qty,
+                "MARKET" if is_market_order else "LIMIT"
             )
 
             # Warn if we couldn't get max_qty - orders might fail
             if max_qty is None:
                 self._log.warning(
-                    "Could not get max_qty for {} - order splitting disabled! min_info={}",
-                    symbol, min_info
+                    "Could not get {} max_qty for {} - order splitting disabled! min_info={}",
+                    "market" if is_market_order else "limit", symbol, min_info
                 )
 
             # Context for notifications and DB

@@ -318,7 +318,8 @@ class OrderQueue:
                 lot = result[0].get("lotSizeFilter", {})
                 return {
                     "min_qty": lot.get("minOrderQty"),
-                    "max_qty": lot.get("maxOrderQty"),  # Maximum quantity per order
+                    "max_qty": lot.get("maxOrderQty"),  # Maximum quantity for LIMIT orders
+                    "max_mkt_qty": lot.get("maxMktOrderQty"),  # Maximum quantity for MARKET orders
                     "min_amt": lot.get("minOrderAmt"),
                     "precision": lot.get("basePrecision"),
                     "qty_step": lot.get("qtyStep", lot.get("basePrecision", "0.000001")),
