@@ -103,7 +103,18 @@ class SymbolState:
     # Track if we have an open position
     has_open_position: bool = False
 
-    def update_volume_history(self, ts: datetime, volume: float, window_minutes: int = 7200) -> None:
+    # Entry price for stop-loss calculation (set when position opens)
+    entry_price: Optional[float] = None
+
+    def update_volume_history(
+        self,
+        ts: datetime,
+        volume: float,
+        window_minutes: int = 7200,
+        *,
+        is_green_candle: bool = True,
+        only_green_candles: bool = False,
+    ) -> None:
         """
         Update volume history and recalculate max.
 
@@ -111,9 +122,12 @@ class SymbolState:
             ts: Candle timestamp
             volume: Candle volume
             window_minutes: 5 days = 5 * 24 * 60 = 7200 minutes
+            is_green_candle: Whether this candle is green (close >= open)
+            only_green_candles: If True, only include volume from green candles
         """
-        # Add new volume
-        self.volume_history.append((ts, volume))
+        # Only add volume if it's a green candle (when filter is enabled)
+        if not only_green_candles or is_green_candle:
+            self.volume_history.append((ts, volume))
 
         # Remove old entries outside window
         from datetime import timedelta

@@ -445,6 +445,9 @@ class TradingBot:
             volume_window_minutes=settings.volume_window_minutes,
             ma_period=settings.ma_exit_period,
             price_acceleration_factor=settings.price_acceleration_factor,
+            stop_loss_pct=settings.stop_loss_pct,
+            skip_red_candle_entry=settings.skip_red_candle_entry,
+            volume_only_green_candles=settings.volume_only_green_candles,
             metrics=self._metrics,
         )
 

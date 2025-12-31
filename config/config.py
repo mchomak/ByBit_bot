@@ -133,6 +133,22 @@ class Settings:
     min_trade_amount_usdt: float = field(
         default_factory=lambda: float(os.getenv("MIN_TRADE_AMOUNT_USDT", "10.0"))
     )
+    # Stop-loss: close position if price drops by this percentage from entry
+    stop_loss_pct: float = field(
+        default_factory=lambda: float(os.getenv("STOP_LOSS_PCT", "7.0"))
+    )
+
+    # ==========================================================================
+    # Entry Filters
+    # ==========================================================================
+    # Skip buying if current candle is red (close < open)
+    skip_red_candle_entry: bool = field(
+        default_factory=lambda: os.getenv("SKIP_RED_CANDLE_ENTRY", "false").lower() == "true"
+    )
+    # Only use volume from green candles for max volume calculation
+    volume_only_green_candles: bool = field(
+        default_factory=lambda: os.getenv("VOLUME_ONLY_GREEN_CANDLES", "true").lower() == "true"
+    )
 
     # ==========================================================================
     # Order Execution
