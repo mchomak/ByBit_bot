@@ -47,6 +47,9 @@ class StrategyEngine:
         volume_window_minutes: int = 7200,  # 5 days
         ma_period: int = 14,
         price_acceleration_factor: float = 3.0,  # close >= open * factor
+        stop_loss_pct: float = 7.0,  # Stop-loss at 7%
+        skip_red_candle_entry: bool = False,  # Skip entry on red candles
+        volume_only_green_candles: bool = True,  # Only use green candle volumes
         metrics: Optional[PipelineMetrics] = None,
         logger: Optional[logging.Logger] = None,
     ) -> None:
@@ -60,6 +63,9 @@ class StrategyEngine:
             volume_window_minutes: Rolling window for max volume (5 days = 7200 min)
             ma_period: Moving average period for exit signal
             price_acceleration_factor: Multiplier for price acceleration check
+            stop_loss_pct: Stop-loss percentage (e.g., 7.0 for 7%)
+            skip_red_candle_entry: If True, skip entry on red candles
+            volume_only_green_candles: If True, only use volume from green candles
             metrics: Optional shared metrics object
             logger: Optional logger instance
         """
@@ -70,6 +76,9 @@ class StrategyEngine:
         self._volume_window = int(volume_window_minutes)
         self._ma_period = int(ma_period)
         self._price_factor = float(price_acceleration_factor)
+        self._stop_loss_pct = float(stop_loss_pct)
+        self._skip_red_candle = bool(skip_red_candle_entry)
+        self._volume_only_green = bool(volume_only_green_candles)
 
         self._metrics = metrics or PipelineMetrics()
         self._log = logger or logging.getLogger(self.__class__.__name__)
@@ -96,17 +105,19 @@ class StrategyEngine:
             if symbol in self._states:
                 self._states[symbol].has_open_position = True
 
-    def mark_position_opened(self, symbol: str) -> None:
+    def mark_position_opened(self, symbol: str, entry_price: Optional[float] = None) -> None:
         """Mark that a position was opened for a symbol."""
         self._open_positions.add(symbol)
         if symbol in self._states:
             self._states[symbol].has_open_position = True
+            self._states[symbol].entry_price = entry_price
 
     def mark_position_closed(self, symbol: str) -> None:
         """Mark that a position was closed for a symbol."""
         self._open_positions.discard(symbol)
         if symbol in self._states:
             self._states[symbol].has_open_position = False
+            self._states[symbol].entry_price = None
 
     async def start(self) -> None:
         """Start the strategy engine consumer loop."""
@@ -198,14 +209,26 @@ class StrategyEngine:
             # Otherwise we can never detect a new volume spike
             previous_max_volume = state.max_volume_5d
 
-            state.update_volume_history(update.timestamp, update.volume, self._volume_window)
+            # Check if this is a green candle (close >= open)
+            is_green_candle = update.close >= update.open
+
+            # Update volume history (optionally filtering to green candles only)
+            state.update_volume_history(
+                update.timestamp,
+                update.volume,
+                self._volume_window,
+                is_green_candle=is_green_candle,
+                only_green_candles=self._volume_only_green,
+            )
             ma14 = state.update_ma14(update.close)
 
             # Sync position state
             state.has_open_position = symbol in self._open_positions
 
             # 4. Evaluate conditions (using previous_max_volume for entry check)
-            signals = self._evaluate_conditions(update, state, ma14, previous_max_volume)
+            signals = self._evaluate_conditions(
+                update, state, ma14, previous_max_volume, is_green_candle
+            )
 
             # 5. Emit signals
             for signal in signals:
@@ -229,6 +252,7 @@ class StrategyEngine:
         state: SymbolState,
         ma14: Optional[float],
         previous_max_volume: float = 0.0,
+        is_green_candle: bool = True,
     ) -> List[TradingSignal]:
         """
         Evaluate entry and exit conditions.
@@ -239,16 +263,38 @@ class StrategyEngine:
             ma14: Current MA14 value
             previous_max_volume: Max volume from history BEFORE current candle was added
                                  (used to detect volume spikes)
+            is_green_candle: Whether the current candle is green (close >= open)
 
         Returns list of signals (0, 1, or 2 if both entry and exit somehow trigger).
         """
         signals: List[TradingSignal] = []
 
         # --- EXIT CHECK (before entry, so we don't enter and exit same candle) ---
-        if state.has_open_position and ma14 is not None:
-            # Exit if price crosses MA14 from above
-            # We check: close <= ma14 OR low <= ma14
-            if update.close <= ma14 or update.low <= ma14:
+        if state.has_open_position:
+            exit_triggered = False
+            exit_reason = None
+
+            # Check 1: Stop-loss - price dropped by stop_loss_pct from entry
+            if state.entry_price is not None and self._stop_loss_pct > 0:
+                stop_loss_price = state.entry_price * (1 - self._stop_loss_pct / 100)
+                if update.close <= stop_loss_price or update.low <= stop_loss_price:
+                    exit_triggered = True
+                    exit_reason = "stop_loss"
+                    self._log.warning(
+                        "STOP-LOSS triggered for %s: price %.6f <= stop %.6f (entry=%.6f, loss=%.1f%%)",
+                        update.symbol, update.close, stop_loss_price,
+                        state.entry_price, self._stop_loss_pct
+                    )
+
+            # Check 2: MA14 crossover (only if stop-loss didn't trigger)
+            if not exit_triggered and ma14 is not None:
+                # Exit if price crosses MA14 from above
+                # We check: close <= ma14 OR low <= ma14
+                if update.close <= ma14 or update.low <= ma14:
+                    exit_triggered = True
+                    exit_reason = "ma14_crossover"
+
+            if exit_triggered:
                 exit_signal = TradingSignal(
                     signal_type=SignalType.EXIT,
                     symbol=update.symbol,
@@ -269,6 +315,14 @@ class StrategyEngine:
             # IMPORTANT: We compare against previous_max_volume (history BEFORE current candle)
             # because if we include current candle in max, a spike can never exceed itself!
 
+            # Skip entry on red candles if configured
+            if self._skip_red_candle and not is_green_candle:
+                logging.debug(
+                    "Skipping entry for %s: red candle (close=%.6f < open=%.6f)",
+                    update.symbol, update.close, update.open
+                )
+                return signals
+
             volume_condition = False
             volume_ratio = 0.0
             if previous_max_volume > 0:
@@ -279,12 +333,13 @@ class StrategyEngine:
             price_change_pct = ((update.close - update.open) / update.open * 100) if update.open > 0 else 0
 
             logging.debug(
-                "Evaluating ENTRY for %s: vol=%.2f (prev_max5d=%.2f, ratio=%.8f), price_accel=%s",
+                "Evaluating ENTRY for %s: vol=%.2f (prev_max5d=%.2f, ratio=%.8f), price_accel=%s, green=%s",
                 update.symbol,
                 update.volume,
                 previous_max_volume,
                 volume_ratio,
                 price_acceleration,
+                is_green_candle,
             )
 
             # Check deduplication: don't enter same minute twice

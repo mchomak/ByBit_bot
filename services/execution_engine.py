@@ -261,9 +261,9 @@ class ExecutionEngine:
             if position_id:
                 self._open_positions[symbol] = position_id
 
-                # Sync with strategy engine
+                # Sync with strategy engine (pass entry price for stop-loss tracking)
                 if self._strategy_engine:
-                    self._strategy_engine.mark_position_opened(symbol)
+                    self._strategy_engine.mark_position_opened(symbol, entry_price=avg_price)
 
                 self._metrics.signals_executed += 1
                 await self._update_signal_execution(signal, True, None)
