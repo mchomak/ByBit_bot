@@ -24,9 +24,6 @@ class TelegramBot:
         /help - List of commands
         /deposit - Add $1000 virtual deposit
         /profile - View deposit balance and profit
-        /blacklist - View blacklisted tokens
-        /blacklist_add - Add token to blacklist (admin)
-        /blacklist_remove - Remove token from blacklist (admin)
     """
 
     def __init__(
@@ -36,7 +33,6 @@ class TelegramBot:
         message_queue: asyncio.Queue,
         session_factory: sessionmaker,
         user_model,
-        blacklist_model=None,
         *,
         get_bot_balance_fn: Optional[Callable[[], Awaitable[float]]] = None,
         poll_interval: float = 1.0,
@@ -50,7 +46,6 @@ class TelegramBot:
             message_queue: Queue for outgoing notifications
             session_factory: SQLAlchemy async session factory
             user_model: User SQLAlchemy model
-            blacklist_model: BlacklistedToken SQLAlchemy model (optional)
             get_bot_balance_fn: Async function to get bot's total USDT balance
             poll_interval: Interval between message sends (rate limiting)
         """
@@ -63,7 +58,6 @@ class TelegramBot:
         self.poll_interval = poll_interval
         self._session_factory = session_factory
         self._user_model = user_model
-        self._blacklist_model = blacklist_model
         self._get_bot_balance = get_bot_balance_fn
 
         # Aiogram dispatcher and router for commands
@@ -103,11 +97,7 @@ class TelegramBot:
                 "/start - Приветствие и информация о боте\n"
                 "/help - Показать это сообщение помощи\n"
                 "/deposit - Добавить $1,000 виртуального депозита\n"
-                "/profile - Посмотреть ваш депозит и прибыль\n"
-                "/blacklist - Посмотреть чёрный список токенов\n\n"
-                "<b>Команды администратора:</b>\n"
-                "/blacklist_add SYMBOL [причина] - Добавить токен в чёрный список\n"
-                "/blacklist_remove SYMBOL - Удалить токен из чёрного списка\n\n"
+                "/profile - Посмотреть ваш депозит и прибыль\n\n"
                 "<b>Как это работает:</b>\n"
                 "При депозите вы получаете виртуальный баланс. "
                 "Когда бот закрывает сделки, ваш депозит обновляется "
@@ -245,181 +235,6 @@ class TelegramBot:
                     "❌ Произошла ошибка при получении вашего профиля.\n"
                     "Пожалуйста, попробуйте позже."
                 )
-
-        @self.router.message(Command("blacklist"))
-        async def cmd_blacklist(message: Message) -> None:
-            """Handle /blacklist command - show blacklisted tokens."""
-            if not self._blacklist_model:
-                await message.answer("⚠️ Чёрный список не настроен.")
-                return
-
-            try:
-                async with self._session_factory() as session:
-                    result = await session.execute(
-                        select(self._blacklist_model).order_by(
-                            self._blacklist_model.symbol
-                        )
-                    )
-                    tokens = result.scalars().all()
-
-                    if not tokens:
-                        await message.answer(
-                            "<b>📋 Чёрный список токенов</b>\n\n"
-                            "Список пуст. Используйте /blacklist_add для добавления."
-                        )
-                        return
-
-                    lines = ["<b>📋 Чёрный список токенов:</b>\n"]
-                    for t in tokens:
-                        reason = f" - {t.reason}" if t.reason else ""
-                        lines.append(f"• <code>{t.symbol}</code>{reason}")
-
-                    lines.append(f"\n<i>Всего: {len(tokens)} токенов</i>")
-                    await message.answer("\n".join(lines))
-
-            except Exception as e:
-                self.logger.exception("Error fetching blacklist: {}", e)
-                await message.answer("❌ Ошибка при получении чёрного списка.")
-
-        @self.router.message(Command("blacklist_add"))
-        async def cmd_blacklist_add(message: Message) -> None:
-            """Handle /blacklist_add <SYMBOL> [reason] - add token to blacklist (admin only)."""
-            if not self._blacklist_model:
-                await message.answer("⚠️ Чёрный список не настроен.")
-                return
-
-            telegram_id = message.from_user.id
-            username = message.from_user.username or message.from_user.first_name
-
-            # Check if user is admin
-            is_admin = await self._check_admin(telegram_id)
-            if not is_admin:
-                await message.answer("⛔ Эта команда доступна только администраторам.")
-                return
-
-            # Parse command arguments
-            args = message.text.split(maxsplit=2)
-            if len(args) < 2:
-                await message.answer(
-                    "❌ Использование: /blacklist_add SYMBOL [причина]\n"
-                    "Пример: /blacklist_add LUNA Нестабильный токен"
-                )
-                return
-
-            symbol = args[1].upper().strip()
-            reason = args[2].strip() if len(args) > 2 else None
-
-            try:
-                async with self._session_factory() as session:
-                    # Check if already blacklisted
-                    result = await session.execute(
-                        select(self._blacklist_model).where(
-                            self._blacklist_model.symbol == symbol
-                        )
-                    )
-                    existing = result.scalar_one_or_none()
-
-                    if existing:
-                        await message.answer(
-                            f"⚠️ Токен <code>{symbol}</code> уже в чёрном списке."
-                        )
-                        return
-
-                    # Add to blacklist
-                    new_entry = self._blacklist_model(
-                        symbol=symbol,
-                        bybit_symbol=f"{symbol}USDT",
-                        reason=reason,
-                        added_by=username,
-                    )
-                    session.add(new_entry)
-                    await session.commit()
-
-                    reason_text = f"\nПричина: {reason}" if reason else ""
-                    await message.answer(
-                        f"✅ Токен <code>{symbol}</code> добавлен в чёрный список.{reason_text}\n\n"
-                        "<i>Токен будет исключён при следующей синхронизации.</i>"
-                    )
-                    self.logger.info(
-                        "User {} added {} to blacklist (reason: {})",
-                        telegram_id, symbol, reason
-                    )
-
-            except Exception as e:
-                self.logger.exception("Error adding to blacklist: {}", e)
-                await message.answer("❌ Ошибка при добавлении в чёрный список.")
-
-        @self.router.message(Command("blacklist_remove"))
-        async def cmd_blacklist_remove(message: Message) -> None:
-            """Handle /blacklist_remove <SYMBOL> - remove token from blacklist (admin only)."""
-            if not self._blacklist_model:
-                await message.answer("⚠️ Чёрный список не настроен.")
-                return
-
-            telegram_id = message.from_user.id
-
-            # Check if user is admin
-            is_admin = await self._check_admin(telegram_id)
-            if not is_admin:
-                await message.answer("⛔ Эта команда доступна только администраторам.")
-                return
-
-            # Parse command arguments
-            args = message.text.split()
-            if len(args) < 2:
-                await message.answer(
-                    "❌ Использование: /blacklist_remove SYMBOL\n"
-                    "Пример: /blacklist_remove LUNA"
-                )
-                return
-
-            symbol = args[1].upper().strip()
-
-            try:
-                async with self._session_factory() as session:
-                    # Find and delete
-                    result = await session.execute(
-                        select(self._blacklist_model).where(
-                            self._blacklist_model.symbol == symbol
-                        )
-                    )
-                    existing = result.scalar_one_or_none()
-
-                    if not existing:
-                        await message.answer(
-                            f"⚠️ Токен <code>{symbol}</code> не найден в чёрном списке."
-                        )
-                        return
-
-                    await session.delete(existing)
-                    await session.commit()
-
-                    await message.answer(
-                        f"✅ Токен <code>{symbol}</code> удалён из чёрного списка.\n\n"
-                        "<i>Токен станет доступен при следующей синхронизации.</i>"
-                    )
-                    self.logger.info(
-                        "User {} removed {} from blacklist",
-                        telegram_id, symbol
-                    )
-
-            except Exception as e:
-                self.logger.exception("Error removing from blacklist: {}", e)
-                await message.answer("❌ Ошибка при удалении из чёрного списка.")
-
-    async def _check_admin(self, telegram_id: int) -> bool:
-        """Check if user is admin."""
-        try:
-            async with self._session_factory() as session:
-                result = await session.execute(
-                    select(self._user_model).where(
-                        self._user_model.telegram_id == telegram_id
-                    )
-                )
-                user = result.scalar_one_or_none()
-                return user is not None and getattr(user, 'is_admin', False)
-        except Exception:
-            return False
 
     async def _get_current_bot_balance(self) -> float:
         """Get current bot USDT balance."""
