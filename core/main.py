@@ -39,7 +39,7 @@ from core.bootstrap_logging import setup_logging
 from core.create_daily_report import DailyReportService
 from bot.TelegramBot import TelegramBot
 from db.database import Database, CandleWriterService
-from db.models import Candle1m, Position, Order, Signal, Token, User
+from db.models import Candle1m, Position, Order, Signal, Token, User, BlacklistedToken
 from db.repository import Repository
 from services.bybit_client import BybitClient
 from services.pipeline_events import PipelineMetrics, CandleUpdate, TradingSignal, SignalType
@@ -259,6 +259,7 @@ class TradingBot:
             message_queue=self._telegram_queue,
             session_factory=self._db.session_factory,
             user_model=User,
+            blacklist_model=BlacklistedToken,
             get_bot_balance_fn=get_bot_balance,
             poll_interval=settings.telegram_rate_limit_s,
         )

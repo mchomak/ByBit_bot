@@ -12,7 +12,7 @@ import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from services.bybit_client import BybitClient
 from db.repository import Repository
-from db.models import Token
+from db.models import Token, BlacklistedToken
 
 
 @dataclass(frozen=True)
@@ -156,16 +156,17 @@ async def sync_tokens_to_database(
     2) Фильтрует по порогу market cap
     3) Получает инструменты Bybit и строит universe baseCoin для категорий
     4) Делает пересечение по symbol==baseCoin
-    5) Сохраняет токены в БД через очередь (upsert по symbol)
-    6) Деактивирует токены, которых больше нет в списке
-    
+    5) Исключает токены из чёрного списка
+    6) Сохраняет токены в БД через очередь (upsert по symbol)
+    7) Деактивирует токены, которых больше нет в списке или в чёрном списке
+
     Args:
         repository: Repository instance для работы с БД
         market_cap_threshold_usd: Минимальный market cap в USD
         bybit_categories: Список категорий Bybit для фильтрации
         symbol_aliases: Словарь алиасов для нормализации символов
         logger: Logger instance
-        
+
     Returns:
         Количество синхронизированных токенов
     """
@@ -174,6 +175,12 @@ async def sync_tokens_to_database(
 
     # Запускаем write worker если еще не запущен
     await repository.start_write_worker()
+
+    # Получаем чёрный список токенов
+    blacklisted_tokens = await repository.get_all(model=BlacklistedToken)
+    blacklisted_symbols: Set[str] = {t.symbol.upper() for t in blacklisted_tokens}
+    if blacklisted_symbols:
+        log.info(f"Loaded {len(blacklisted_symbols)} blacklisted tokens: {sorted(blacklisted_symbols)}")
 
     async with CoinPaprikaClient(logger=log) as paprika, BybitClient(logger=log) as bybit:
         log.info("Fetching CoinPaprika tickers...")
@@ -191,11 +198,18 @@ async def sync_tokens_to_database(
         synced_symbols: Set[str] = set()
         tokens_to_sync = []
 
+        blacklisted_count = 0
         for t in candidates:
             normalized_symbol = _apply_symbol_aliases(t.symbol, aliases)
             bybit_cats: Set[str] = base_map.get(normalized_symbol, set())
 
             if not bybit_cats:
+                continue
+
+            # Skip blacklisted tokens
+            if normalized_symbol.upper() in blacklisted_symbols:
+                blacklisted_count += 1
+                log.debug(f"Skipping blacklisted token: {normalized_symbol}")
                 continue
 
             # Формируем bybit_symbol (для spot обычно SYMBOL+USDT)
@@ -215,6 +229,9 @@ async def sync_tokens_to_database(
             })
 
             synced_symbols.add(normalized_symbol)
+
+        if blacklisted_count > 0:
+            log.info(f"Skipped {blacklisted_count} blacklisted tokens")
 
         # Сортируем по market cap (от большего к меньшему)
         tokens_to_sync.sort(key=lambda x: x["market_cap_usd"], reverse=True)
@@ -241,19 +258,38 @@ async def sync_tokens_to_database(
             filters={"is_active": True}
         )
 
-        # Деактивируем токены, которых больше нет в списке
+        # Деактивируем токены, которых больше нет в списке ИЛИ в чёрном списке
         tokens_to_deactivate = 0
+        blacklisted_deactivated = 0
         for token in active_tokens:
-            if token.symbol not in synced_symbols:
+            should_deactivate = False
+            reason = ""
+
+            # Check if in blacklist
+            if token.symbol.upper() in blacklisted_symbols:
+                should_deactivate = True
+                reason = "blacklisted"
+                blacklisted_deactivated += 1
+            # Check if no longer in sync list
+            elif token.symbol not in synced_symbols:
+                should_deactivate = True
+                reason = "not tradable"
+
+            if should_deactivate:
                 await repository.enqueue_update(
                     model=Token,
                     filter_by={"symbol": token.symbol},
                     update_values={"is_active": False}
                 )
                 tokens_to_deactivate += 1
+                log.debug(f"Deactivating token {token.symbol}: {reason}")
 
         if tokens_to_deactivate > 0:
-            log.info(f"Deactivating {tokens_to_deactivate} tokens that are no longer tradable")
+            log.info(
+                f"Deactivating {tokens_to_deactivate} tokens "
+                f"({blacklisted_deactivated} blacklisted, "
+                f"{tokens_to_deactivate - blacklisted_deactivated} no longer tradable)"
+            )
 
         # Ждем завершения всех операций в очереди
         log.info("Waiting for write queue to complete...")

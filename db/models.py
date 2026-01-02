@@ -108,6 +108,24 @@ class Token(Base):
     __table_args__ = (Index("ix_tokens_active", "is_active"),)
 
 
+class BlacklistedToken(Base):
+    """
+    Tokens that should be excluded from trading.
+
+    Manually added tokens that will be removed from the active token list
+    during sync and startup.
+    """
+
+    __tablename__ = "blacklisted_tokens"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    symbol = Column(String(20), nullable=False, unique=True, index=True)  # e.g., "BTC"
+    bybit_symbol = Column(String(30), nullable=True)  # e.g., "BTCUSDT" (optional)
+    reason = Column(String(200), nullable=True)  # Why this token is blacklisted
+    added_by = Column(String(100), nullable=True)  # Who added it (telegram username)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
 class Candle1m(Base):
     """
     1-minute OHLCV candles for all monitored symbols.
