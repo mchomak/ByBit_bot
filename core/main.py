@@ -119,6 +119,7 @@ class TradingBot:
 
             # 4. Run initial token sync or load existing tokens
             symbols = await self._init_tokens()
+            logger.info(f"Trading symbols: {len(symbols)}")
 
             if not symbols:
                 logger.error("No symbols to trade. Check token sync configuration.")
@@ -305,22 +306,22 @@ class TradingBot:
         assert self._db is not None
 
         # Check existing tokens
-        tokens = await self._repository.get_all(
-            Token,
-            filters={"is_active": True},
-            limit=settings.max_symbols if settings.max_symbols > 0 else None
-        )
+        # tokens = await self._repository.get_all(
+        #     Token,
+        #     filters={"is_active": True},
+        #     limit=settings.max_symbols if settings.max_symbols > 0 else None
+        # )
 
-        if tokens:
-            logger.info("Loaded %d active tokens from database", len(tokens))
-            # Filter by current category
-            category = settings.bybit_category.lower()
-            symbols = [
-                t.bybit_symbol for t in tokens
-                if t.bybit_categories and category in t.bybit_categories.lower()
-            ]
-            logger.info("Filtered to %d symbols for category '%s'", len(symbols), category)
-            return symbols
+        # if tokens:
+        #     logger.info("Loaded %d active tokens from database", len(tokens))
+        #     # Filter by current category
+        #     category = settings.bybit_category.lower()
+        #     symbols = [
+        #         t.bybit_symbol for t in tokens
+        #         if t.bybit_categories and category in t.bybit_categories.lower()
+        #     ]
+        #     logger.info("Filtered to %d symbols for category '%s'", len(symbols), category)
+        #     return symbols
 
         # No tokens - run initial sync
         logger.info("No tokens in database, running initial sync...")
@@ -331,6 +332,10 @@ class TradingBot:
             bybit_categories=settings.token_sync_categories_list,
             symbol_aliases=settings.symbol_aliases_dict,
             sync_interval_hours=24,  # Will be managed by scheduler
+            filter_st_tokens=settings.filter_st_tokens,
+            filter_stale_prices=settings.filter_stale_prices,
+            stale_lookback_minutes=settings.stale_lookback_minutes,
+            stale_consecutive_candles=settings.stale_consecutive_candles,
         )
 
         count = await self._token_sync_service.sync_now()

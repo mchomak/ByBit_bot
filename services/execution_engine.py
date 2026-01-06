@@ -14,7 +14,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from datetime import datetime, timezone, timedelta
 from typing import Any, Callable, Dict, Optional, Set
 import os
 import sys
@@ -24,6 +25,17 @@ from sqlalchemy import select
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from services.pipeline_events import PipelineMetrics, SignalType, TradingSignal
+
+
+@dataclass
+class ExitFailureInfo:
+    """Tracks repeated exit failures for a symbol."""
+    symbol: str
+    position_id: int
+    failure_count: int = 0
+    last_failure_time: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    last_error: str = ""
+    notified_user: bool = False  # Whether we've sent a "position stuck" notification
 
 
 class ExecutionEngine:
@@ -89,6 +101,11 @@ class ExecutionEngine:
         self._open_positions: Dict[str, int] = {}  # symbol -> position_id
         self._entry_minutes: Set[tuple] = set()  # (symbol, minute_ts) dedup
 
+        # Track exit failures to prevent spam and handle stuck positions
+        self._exit_failures: Dict[str, ExitFailureInfo] = {}
+        self._exit_cooldown_minutes = 5  # Wait 5 minutes between exit retry attempts
+        self._max_exit_failures = 3  # After 3 failures, mark position as stuck
+
         # Task handle
         self._task: Optional[asyncio.Task] = None
         self._stop_event = asyncio.Event()
@@ -134,19 +151,68 @@ class ExecutionEngine:
         self._log.info("Execution engine stopped")
 
     async def _sync_open_positions(self) -> None:
-        """Load open positions from database."""
+        """Load open positions from database and check for invalid/blacklisted symbols."""
         try:
             async with self._session_factory() as session:
-                from db.models import PositionStatus
+                from db.models import PositionStatus, BlacklistedToken
 
+                # Get open positions
                 stmt = select(self._position_model).where(
                     self._position_model.status == PositionStatus.OPEN
                 )
                 result = await session.execute(stmt)
                 positions = result.scalars().all()
 
-            self._open_positions = {p.symbol: p.id for p in positions}
-            self._log.info("Synced %d open positions from DB", len(self._open_positions))
+                # Get blacklisted tokens
+                blacklist_stmt = select(BlacklistedToken)
+                blacklist_result = await session.execute(blacklist_stmt)
+                blacklisted = {t.symbol.upper() for t in blacklist_result.scalars().all()}
+
+            # Process positions
+            valid_positions = {}
+            positions_to_close = []
+
+            for p in positions:
+                symbol = p.symbol or ""
+                coin = symbol.replace("USDT", "").replace("USDC", "")
+
+                # Check for invalid symbol
+                if not symbol or not coin or len(coin) < 2:
+                    self._log.warning(
+                        "Found position with invalid symbol: id=%d, symbol='%s'",
+                        p.id, symbol
+                    )
+                    positions_to_close.append((p.id, symbol, "invalid_symbol"))
+                    continue
+
+                # Check if symbol is blacklisted
+                if coin.upper() in blacklisted:
+                    self._log.warning(
+                        "Found open position for blacklisted token: %s (id=%d)",
+                        symbol, p.id
+                    )
+                    positions_to_close.append((p.id, symbol, f"blacklisted_token: {coin}"))
+                    continue
+
+                valid_positions[symbol] = p.id
+
+            # Close invalid/blacklisted positions
+            for pos_id, symbol, reason in positions_to_close:
+                await self._close_position_as_failed(
+                    position_id=pos_id,
+                    symbol=symbol,
+                    reason=reason,
+                )
+
+            self._open_positions = valid_positions
+
+            if positions_to_close:
+                self._log.info(
+                    "Synced %d open positions from DB, closed %d invalid/blacklisted",
+                    len(valid_positions), len(positions_to_close)
+                )
+            else:
+                self._log.info("Synced %d open positions from DB", len(self._open_positions))
 
         except Exception as e:
             self._log.exception("Failed to sync positions: %s", e)
@@ -302,10 +368,55 @@ class ExecutionEngine:
 
         position_id = self._open_positions[symbol]
 
+        # Check if this symbol has repeated exit failures (cooldown)
+        if symbol in self._exit_failures:
+            failure_info = self._exit_failures[symbol]
+            time_since_failure = datetime.now(timezone.utc) - failure_info.last_failure_time
+            cooldown = timedelta(minutes=self._exit_cooldown_minutes)
+
+            # If we've hit max failures, close position with error and stop trying
+            if failure_info.failure_count >= self._max_exit_failures:
+                if not failure_info.notified_user:
+                    self._log.error(
+                        "Position %s stuck after %d failed sell attempts. "
+                        "Last error: %s. Closing position as FAILED.",
+                        symbol, failure_info.failure_count, failure_info.last_error
+                    )
+                    # Close position with error reason
+                    await self._close_position_as_failed(
+                        position_id=position_id,
+                        symbol=symbol,
+                        reason=f"sell_failed_{failure_info.failure_count}x: {failure_info.last_error}"
+                    )
+                    failure_info.notified_user = True
+                return
+
+            # Still in cooldown period
+            if time_since_failure < cooldown:
+                self._log.debug(
+                    "Skipping exit for %s: in cooldown (failed %d times, retry in %d min)",
+                    symbol, failure_info.failure_count,
+                    int((cooldown - time_since_failure).total_seconds() / 60)
+                )
+                return
+
         # Get position details
         position = await self._get_position(position_id)
         if not position:
             self._log.warning("Position %d not found for %s", position_id, symbol)
+            return
+
+        # Validate symbol before attempting sell
+        coin = symbol.replace("USDT", "").replace("USDC", "")
+        if not coin or len(coin) < 2:
+            self._log.error(
+                "Invalid symbol %s (coin=%s) - closing position as failed", symbol, coin
+            )
+            await self._close_position_as_failed(
+                position_id=position_id,
+                symbol=symbol,
+                reason=f"invalid_symbol: {symbol}"
+            )
             return
 
         # Calculate expected P&L for context
@@ -323,6 +434,10 @@ class ExecutionEngine:
         )
 
         if order_result.get("success"):
+            # Clear failure tracking on success
+            if symbol in self._exit_failures:
+                del self._exit_failures[symbol]
+
             # Use actual filled values from batch result
             filled_qty = order_result.get("filled_qty", position.entry_amount)
             avg_exit_price = order_result.get("avg_price", signal.price)
@@ -382,9 +497,31 @@ class ExecutionEngine:
                     order_result.get("errors", [])
                 )
         else:
-            await self._update_signal_execution(
-                signal, False, order_result.get("error", "Order failed")
+            # Track failure
+            error_msg = order_result.get("error", "Order failed")
+            if symbol in self._exit_failures:
+                self._exit_failures[symbol].failure_count += 1
+                self._exit_failures[symbol].last_failure_time = datetime.now(timezone.utc)
+                self._exit_failures[symbol].last_error = error_msg
+            else:
+                self._exit_failures[symbol] = ExitFailureInfo(
+                    symbol=symbol,
+                    position_id=position_id,
+                    failure_count=1,
+                    last_failure_time=datetime.now(timezone.utc),
+                    last_error=error_msg,
+                )
+
+            self._log.warning(
+                "Exit failed for %s (attempt %d/%d): %s. Next retry in %d minutes.",
+                symbol,
+                self._exit_failures[symbol].failure_count,
+                self._max_exit_failures,
+                error_msg,
+                self._exit_cooldown_minutes,
             )
+
+            await self._update_signal_execution(signal, False, error_msg)
 
     async def _get_available_balance(self) -> float:
         """Get available USDT balance."""
@@ -525,6 +662,67 @@ class ExecutionEngine:
 
         except Exception as e:
             self._log.exception("Failed to close position: %s", e)
+            return False
+
+    async def _close_position_as_failed(
+        self,
+        position_id: int,
+        symbol: str,
+        reason: str,
+    ) -> bool:
+        """
+        Close a position as FAILED when sell cannot be completed.
+
+        This happens when:
+        - Symbol is invalid/delisted
+        - No balance available
+        - Max sell retries exceeded
+
+        The position is marked as closed with exit_reason containing the error.
+        """
+        try:
+            from db.models import PositionStatus
+            from sqlalchemy import update
+
+            self._log.warning(
+                "Closing position %s (id=%d) as FAILED: %s",
+                symbol, position_id, reason
+            )
+
+            async with self._session_factory() as session:
+                stmt = (
+                    update(self._position_model)
+                    .where(self._position_model.id == position_id)
+                    .values(
+                        status=PositionStatus.CLOSED,
+                        exit_time=datetime.now(timezone.utc),
+                        exit_reason=reason,
+                        exit_price=0,
+                        exit_amount=0,
+                        exit_value_usdt=0,
+                        profit_usdt=0,
+                        profit_pct=-100.0,  # Mark as total loss
+                    )
+                )
+                await session.execute(stmt)
+                await session.commit()
+
+            # Remove from open positions tracking
+            if symbol in self._open_positions:
+                del self._open_positions[symbol]
+
+            # Clear failure tracking
+            if symbol in self._exit_failures:
+                del self._exit_failures[symbol]
+
+            # Sync with strategy engine
+            if self._strategy_engine:
+                self._strategy_engine.mark_position_closed(symbol)
+
+            return True
+
+        except Exception as e:
+            self._log.exception("Failed to close position as failed: %s", e)
             return False
 
     async def _persist_signal(self, signal: TradingSignal) -> None:

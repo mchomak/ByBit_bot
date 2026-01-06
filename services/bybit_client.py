@@ -29,6 +29,7 @@ class BybitInstrument:
     base_coin: str
     quote_coin: str
     category: str  # spot/linear/inverse/option
+    is_st: bool = False  # Special Treatment (high risk) token
 
 
 class BybitAPIError(RuntimeError):
@@ -225,12 +226,33 @@ class BybitClient:
             quote_coin = (it.get("quoteCoin") or "").strip()
             if not symbol or not base_coin:
                 continue
+
+            # Check for ST (Special Treatment) tokens
+            # 1. Bybit may return "innovation" or "riskTag" field for ST tokens
+            # 2. Some ST tokens have "ST" in their symbol name
+            is_st = False
+
+            # Check innovation field (for spot) - "1" means innovation zone (higher risk)
+            innovation = str(it.get("innovation", "0"))
+            if innovation == "1":
+                is_st = True
+
+            # Check for ST suffix/prefix in symbol (e.g., STUSDT, XXXST)
+            if base_coin.upper().endswith("ST") and len(base_coin) > 2:
+                is_st = True
+
+            # Check contractType for risky designation (futures)
+            contract_type = (it.get("contractType") or "").strip()
+            if "ST" in contract_type.upper():
+                is_st = True
+
             instruments.append(
                 BybitInstrument(
                     symbol=symbol,
                     base_coin=base_coin.upper(),
                     quote_coin=quote_coin.upper(),
                     category=category,
+                    is_st=is_st,
                 )
             )
         return instruments
@@ -291,6 +313,110 @@ class BybitClient:
             async for inst in self.iter_instruments(category=cat, status=status):
                 out.setdefault(inst.base_coin, set()).add(inst.category)
         return out
+
+    async def get_st_tokens(
+        self,
+        categories: List[str],
+        status: Optional[str] = "Trading",
+    ) -> Set[str]:
+        """
+        Get set of ST (Special Treatment / high-risk) tokens.
+
+        Returns baseCoin symbols that are marked as ST by Bybit.
+        """
+        st_tokens: Set[str] = set()
+        for cat in categories:
+            async for inst in self.iter_instruments(category=cat, status=status):
+                if inst.is_st:
+                    st_tokens.add(inst.base_coin)
+                    self._log.debug("Found ST token: %s (%s)", inst.base_coin, inst.symbol)
+        return st_tokens
+
+    async def check_stale_prices(
+        self,
+        category: str,
+        symbols: List[str],
+        lookback_minutes: int = 50,
+        consecutive_stale: int = 3,
+        concurrency: int = 10,
+    ) -> Set[str]:
+        """
+        Check for symbols with stale prices (no price movement).
+
+        A symbol is considered stale if for N or more consecutive minutes
+        the open price equals the close price (no trading activity).
+
+        Args:
+            category: Bybit category (spot, linear, etc.)
+            symbols: List of symbols to check
+            lookback_minutes: How many minutes of history to check
+            consecutive_stale: Number of consecutive stale candles to trigger filter
+            concurrency: Max concurrent API requests
+
+        Returns:
+            Set of symbol names that have stale prices (should be excluded)
+        """
+        stale_symbols: Set[str] = set()
+        sem = asyncio.Semaphore(concurrency)
+
+        async def _check_one(symbol: str) -> Optional[str]:
+            async with sem:
+                try:
+                    # Fetch recent candles
+                    raw = await self.get_kline_page(
+                        category=category,
+                        symbol=symbol,
+                        interval="1",
+                        limit=lookback_minutes,
+                    )
+
+                    if not raw or len(raw) < consecutive_stale:
+                        return None
+
+                    # Check for consecutive stale candles (open == close)
+                    max_consecutive = 0
+                    current_streak = 0
+
+                    # raw is sorted newest->oldest, reverse for chronological order
+                    for candle in reversed(raw):
+                        try:
+                            open_price = float(candle[1])
+                            close_price = float(candle[4])
+
+                            if open_price == close_price:
+                                current_streak += 1
+                                max_consecutive = max(max_consecutive, current_streak)
+                            else:
+                                current_streak = 0
+                        except (IndexError, ValueError):
+                            continue
+
+                    if max_consecutive >= consecutive_stale:
+                        self._log.debug(
+                            "Stale price detected for %s: %d consecutive flat candles",
+                            symbol, max_consecutive
+                        )
+                        return symbol
+
+                    return None
+
+                except Exception as e:
+                    self._log.debug("Failed to check stale prices for %s: %s", symbol, e)
+                    return None
+
+        results = await asyncio.gather(*[_check_one(s) for s in symbols])
+
+        for result in results:
+            if result:
+                stale_symbols.add(result)
+
+        if stale_symbols:
+            self._log.info(
+                "Found %d symbols with stale prices (>=%d consecutive flat candles)",
+                len(stale_symbols), consecutive_stale
+            )
+
+        return stale_symbols
 
     # -------------------------------------------------------------------------
     # Kline REST (bootstrap)
