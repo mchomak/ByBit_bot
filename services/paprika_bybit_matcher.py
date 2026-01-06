@@ -149,6 +149,10 @@ async def sync_tokens_to_database(
     bybit_categories: List[str],
     symbol_aliases: Optional[Dict[str, str]] = None,
     logger: Optional[logging.Logger] = None,
+    filter_st_tokens: bool = True,
+    filter_stale_prices: bool = True,
+    stale_lookback_minutes: int = 50,
+    stale_consecutive_candles: int = 3,
 ) -> int:
     """
     Синхронизирует токены в БД:
@@ -157,8 +161,10 @@ async def sync_tokens_to_database(
     3) Получает инструменты Bybit и строит universe baseCoin для категорий
     4) Делает пересечение по symbol==baseCoin
     5) Исключает токены из чёрного списка
-    6) Сохраняет токены в БД через очередь (upsert по symbol)
-    7) Деактивирует токены, которых больше нет в списке или в чёрном списке
+    6) Исключает ST (Special Treatment / высокорисковые) токены
+    7) Исключает токены с неактивной ценой (stale prices)
+    8) Сохраняет токены в БД через очередь (upsert по symbol)
+    9) Деактивирует токены, которых больше нет в списке или отфильтрованы
 
     Args:
         repository: Repository instance для работы с БД
@@ -166,6 +172,10 @@ async def sync_tokens_to_database(
         bybit_categories: Список категорий Bybit для фильтрации
         symbol_aliases: Словарь алиасов для нормализации символов
         logger: Logger instance
+        filter_st_tokens: Исключать ST (Special Treatment) токены
+        filter_stale_prices: Исключать токены с неактивной ценой
+        stale_lookback_minutes: Сколько минут истории проверять для stale
+        stale_consecutive_candles: Сколько подряд свечей open==close для фильтрации
 
     Returns:
         Количество синхронизированных токенов
@@ -195,10 +205,19 @@ async def sync_tokens_to_database(
         log.info("Fetching Bybit instruments baseCoin universe for categories: %s", bybit_categories)
         base_map = await bybit.get_base_coin_map(categories=bybit_categories)
 
+        # Get ST (Special Treatment) tokens if filtering enabled
+        st_tokens: Set[str] = set()
+        if filter_st_tokens:
+            log.info("Checking for ST (Special Treatment / high-risk) tokens...")
+            st_tokens = await bybit.get_st_tokens(categories=bybit_categories)
+            if st_tokens:
+                log.info("Found %d ST tokens to exclude: %s", len(st_tokens), sorted(st_tokens)[:20])
+
         synced_symbols: Set[str] = set()
         tokens_to_sync = []
 
         blacklisted_count = 0
+        st_filtered_count = 0
         for t in candidates:
             normalized_symbol = _apply_symbol_aliases(t.symbol, aliases)
             bybit_cats: Set[str] = base_map.get(normalized_symbol, set())
@@ -210,6 +229,12 @@ async def sync_tokens_to_database(
             if normalized_symbol.upper() in blacklisted_symbols:
                 blacklisted_count += 1
                 log.debug(f"Skipping blacklisted token: {normalized_symbol}")
+                continue
+
+            # Skip ST (Special Treatment) tokens
+            if normalized_symbol.upper() in st_tokens:
+                st_filtered_count += 1
+                log.debug(f"Skipping ST token: {normalized_symbol}")
                 continue
 
             # Формируем bybit_symbol (для spot обычно SYMBOL+USDT)
@@ -232,6 +257,46 @@ async def sync_tokens_to_database(
 
         if blacklisted_count > 0:
             log.info(f"Skipped {blacklisted_count} blacklisted tokens")
+        if st_filtered_count > 0:
+            log.info(f"Skipped {st_filtered_count} ST (high-risk) tokens")
+
+        # Check for stale prices (inactive tokens) if enabled
+        stale_filtered_count = 0
+        if filter_stale_prices and tokens_to_sync:
+            log.info(
+                "Checking for stale prices (%d consecutive flat candles in last %d minutes)...",
+                stale_consecutive_candles, stale_lookback_minutes
+            )
+            # Get list of bybit_symbols to check
+            symbols_to_check = [t["bybit_symbol"] for t in tokens_to_sync]
+
+            # Check which category to use (prefer spot)
+            check_category = "spot" if "spot" in bybit_categories else bybit_categories[0]
+
+            stale_symbols = await bybit.check_stale_prices(
+                category=check_category,
+                symbols=symbols_to_check,
+                lookback_minutes=stale_lookback_minutes,
+                consecutive_stale=stale_consecutive_candles,
+            )
+
+            if stale_symbols:
+                # Filter out stale tokens
+                original_count = len(tokens_to_sync)
+                tokens_to_sync = [
+                    t for t in tokens_to_sync
+                    if t["bybit_symbol"] not in stale_symbols
+                ]
+                stale_filtered_count = original_count - len(tokens_to_sync)
+                log.info(
+                    f"Filtered out {stale_filtered_count} tokens with stale prices: "
+                    f"{sorted(list(stale_symbols)[:10])}{'...' if len(stale_symbols) > 10 else ''}"
+                )
+
+                # Also remove from synced_symbols
+                for symbol in list(synced_symbols):
+                    if f"{symbol}USDT" in stale_symbols:
+                        synced_symbols.discard(symbol)
 
         # Сортируем по market cap (от большего к меньшему)
         tokens_to_sync.sort(key=lambda x: x["market_cap_usd"], reverse=True)

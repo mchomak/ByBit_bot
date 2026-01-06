@@ -106,6 +106,26 @@ class Settings:
     )
 
     # ==========================================================================
+    # Token Filters
+    # ==========================================================================
+    # Filter out ST (Special Treatment / high-risk) tokens marked by Bybit
+    filter_st_tokens: bool = field(
+        default_factory=lambda: os.getenv("FILTER_ST_TOKENS", "true").lower() == "true"
+    )
+    # Filter out tokens with stale prices (no price movement)
+    filter_stale_prices: bool = field(
+        default_factory=lambda: os.getenv("FILTER_STALE_PRICES", "true").lower() == "true"
+    )
+    # Lookback period for stale price check (in minutes)
+    stale_lookback_minutes: int = field(
+        default_factory=lambda: int(os.getenv("STALE_LOOKBACK_MINUTES", "50"))
+    )
+    # Number of consecutive candles with open==close to consider stale
+    stale_consecutive_candles: int = field(
+        default_factory=lambda: int(os.getenv("STALE_CONSECUTIVE_CANDLES", "3"))
+    )
+
+    # ==========================================================================
     # Strategy Settings
     # ==========================================================================
     # Volume spike: current volume must exceed max 5-day volume

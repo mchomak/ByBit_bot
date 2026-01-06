@@ -24,13 +24,15 @@ from db.models import Base, Token
 class TokenSyncService:
     """
     Сервис для периодической синхронизации токенов в БД.
-    
+
     Функции:
     - Автоматическая синхронизация по расписанию
     - Обработка ошибок и повторные попытки
+    - Фильтрация ST (высокорисковых) токенов
+    - Фильтрация токенов с неактивной ценой
     - Логирование статистики
     """
-    
+
     def __init__(
         self,
         repository: Repository,
@@ -38,17 +40,25 @@ class TokenSyncService:
         bybit_categories: Optional[list] = None,
         symbol_aliases: Optional[dict] = None,
         sync_interval_hours: int = 6,
+        filter_st_tokens: bool = True,
+        filter_stale_prices: bool = True,
+        stale_lookback_minutes: int = 50,
+        stale_consecutive_candles: int = 3,
         logger: Optional[logging.Logger] = None,
     ):
         """
         Инициализация сервиса.
-        
+
         Args:
             repository: Repository для работы с БД
             market_cap_threshold_usd: Минимальный market cap
             bybit_categories: Список категорий Bybit
             symbol_aliases: Словарь алиасов символов
             sync_interval_hours: Интервал синхронизации в часах
+            filter_st_tokens: Фильтровать ST (высокорисковые) токены
+            filter_stale_prices: Фильтровать токены с неактивной ценой
+            stale_lookback_minutes: Период проверки неактивности (минуты)
+            stale_consecutive_candles: Кол-во подряд свечей open==close
             logger: Logger instance
         """
         self.repository = repository
@@ -56,6 +66,10 @@ class TokenSyncService:
         self.bybit_categories = bybit_categories or ["linear", "spot"]
         self.symbol_aliases = symbol_aliases or {}
         self.sync_interval = timedelta(hours=sync_interval_hours)
+        self.filter_st_tokens = filter_st_tokens
+        self.filter_stale_prices = filter_stale_prices
+        self.stale_lookback_minutes = stale_lookback_minutes
+        self.stale_consecutive_candles = stale_consecutive_candles
         self.log = logger or logging.getLogger(self.__class__.__name__)
         
         self._task: Optional[asyncio.Task] = None
@@ -119,13 +133,17 @@ class TokenSyncService:
         try:
             self.log.info("Starting token synchronization...")
             start_time = datetime.now()
-            
+
             synced_count = await sync_tokens_to_database(
                 repository=self.repository,
                 market_cap_threshold_usd=self.market_cap_threshold,
                 bybit_categories=self.bybit_categories,
                 symbol_aliases=self.symbol_aliases,
                 logger=self.log,
+                filter_st_tokens=self.filter_st_tokens,
+                filter_stale_prices=self.filter_stale_prices,
+                stale_lookback_minutes=self.stale_lookback_minutes,
+                stale_consecutive_candles=self.stale_consecutive_candles,
             )
             
             duration = (datetime.now() - start_time).total_seconds()
@@ -144,18 +162,22 @@ class TokenSyncService:
     async def sync_now(self) -> int:
         """
         Принудительная синхронизация вне расписания.
-        
+
         Returns:
             Количество синхронизированных токенов
         """
         self.log.info("Manual sync triggered")
-        
+
         synced_count = await sync_tokens_to_database(
             repository=self.repository,
             market_cap_threshold_usd=self.market_cap_threshold,
             bybit_categories=self.bybit_categories,
             symbol_aliases=self.symbol_aliases,
             logger=self.log,
+            filter_st_tokens=self.filter_st_tokens,
+            filter_stale_prices=self.filter_stale_prices,
+            stale_lookback_minutes=self.stale_lookback_minutes,
+            stale_consecutive_candles=self.stale_consecutive_candles,
         )
         
         self._last_sync = datetime.now()
@@ -166,7 +188,7 @@ class TokenSyncService:
     def get_status(self) -> dict:
         """
         Возвращает текущий статус сервиса.
-        
+
         Returns:
             Словарь со статусом сервиса
         """
@@ -177,6 +199,10 @@ class TokenSyncService:
             "sync_interval_hours": self.sync_interval.total_seconds() / 3600,
             "market_cap_threshold": self.market_cap_threshold,
             "bybit_categories": self.bybit_categories,
+            "filter_st_tokens": self.filter_st_tokens,
+            "filter_stale_prices": self.filter_stale_prices,
+            "stale_lookback_minutes": self.stale_lookback_minutes,
+            "stale_consecutive_candles": self.stale_consecutive_candles,
         }
 
 

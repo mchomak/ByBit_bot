@@ -331,6 +331,10 @@ class TradingBot:
             bybit_categories=settings.token_sync_categories_list,
             symbol_aliases=settings.symbol_aliases_dict,
             sync_interval_hours=24,  # Will be managed by scheduler
+            filter_st_tokens=settings.filter_st_tokens,
+            filter_stale_prices=settings.filter_stale_prices,
+            stale_lookback_minutes=settings.stale_lookback_minutes,
+            stale_consecutive_candles=settings.stale_consecutive_candles,
         )
 
         count = await self._token_sync_service.sync_now()
