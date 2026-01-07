@@ -162,8 +162,10 @@ class Settings:
     # Entry Filters
     # ==========================================================================
     # Skip buying if current candle is red (close < open)
+    # When enabled, entry only triggers on green candles (close >= open)
+    # This filter is applied AFTER volume/price conditions pass
     skip_red_candle_entry: bool = field(
-        default_factory=lambda: os.getenv("SKIP_RED_CANDLE_ENTRY", "false").lower() == "true"
+        default_factory=lambda: os.getenv("SKIP_RED_CANDLE_ENTRY", "true").lower() == "true"
     )
     # Only use volume from green candles for max volume calculation
     volume_only_green_candles: bool = field(

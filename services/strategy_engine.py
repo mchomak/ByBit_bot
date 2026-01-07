@@ -5,8 +5,11 @@ Consumes CandleUpdate events, maintains per-symbol rolling statistics,
 evaluates entry/exit conditions, and emits signals.
 
 Strategy Rules:
-- ENTRY: volume > max_5d_volume OR close >= open * 3 (either condition triggers)
+- ENTRY: (volume > max_5d_volume OR close >= open * 3) AND candle is green
+  - First checks volume spike or price acceleration condition
+  - Then verifies candle is green (close >= open) if filter enabled
 - EXIT: price crosses MA14 from above (close <= ma14 OR low <= ma14)
+        OR stop-loss triggered (price dropped by stop_loss_pct from entry)
 """
 
 from __future__ import annotations
@@ -315,14 +318,6 @@ class StrategyEngine:
             # IMPORTANT: We compare against previous_max_volume (history BEFORE current candle)
             # because if we include current candle in max, a spike can never exceed itself!
 
-            # Skip entry on red candles if configured
-            if self._skip_red_candle and not is_green_candle:
-                logging.debug(
-                    "Skipping entry for %s: red candle (close=%.6f < open=%.6f)",
-                    update.symbol, update.close, update.open
-                )
-                return signals
-
             volume_condition = False
             volume_ratio = 0.0
             if previous_max_volume > 0:
@@ -345,8 +340,19 @@ class StrategyEngine:
             # Check deduplication: don't enter same minute twice
             already_entered = state.last_entry_minute == update.timestamp
 
-            # Entry condition: volume spike OR price acceleration (not both required)
-            entry_condition = (volume_condition or price_acceleration) and not already_entered
+            # Base entry condition: volume spike OR price acceleration (not both required)
+            base_entry_condition = (volume_condition or price_acceleration) and not already_entered
+
+            # After volume/price check passes, verify candle is green (if filter enabled)
+            # This ensures we only buy on positive candles (close >= open)
+            if base_entry_condition and self._skip_red_candle and not is_green_candle:
+                logging.info(
+                    "Skipping entry for %s: red candle (close=%.6f < open=%.6f) after volume/price check passed",
+                    update.symbol, update.close, update.open
+                )
+                return signals
+
+            entry_condition = base_entry_condition
 
             if entry_condition:
                 entry_signal = TradingSignal(
