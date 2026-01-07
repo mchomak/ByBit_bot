@@ -103,6 +103,7 @@ class Token(Base):
     market_cap_usd = Column(BigInteger, nullable=True)
     bybit_categories = Column(String(50), nullable=True)  # Comma-separated: "spot,linear"
     is_active = Column(Boolean, default=True)  # Whether to trade this token
+    max_market_qty = Column(Float, nullable=True)  # Max quantity for market orders (learned from errors)
     last_updated = Column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (Index("ix_tokens_active", "is_active"),)

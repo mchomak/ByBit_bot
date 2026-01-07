@@ -5,17 +5,20 @@ Integrates the OrderQueue from trade_client.py with the trading pipeline.
 Executes real orders on Bybit, logs to database, and sends Telegram notifications.
 
 Supports order splitting when quantity exceeds exchange maxOrderQty limit.
+Learns max quantities from error messages and stores them in the database.
 """
 
 from __future__ import annotations
 
 import asyncio
 import math
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Awaitable
 
 from loguru import logger
+from sqlalchemy import select, update
 from sqlalchemy.orm import sessionmaker
 
 import sys
@@ -24,6 +27,39 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from trade.trade_client import OrderQueue, QueuedOrder, OrderStatus, Category, truncate_to_step
 from config.config import settings
+
+
+def parse_max_qty_from_error(error_message: str) -> Optional[float]:
+    """
+    Parse max quantity limit from Bybit error message.
+
+    Example error: "The quantity of a single market order must be less than
+                   the maximum allowed per order: 1100000MEE."
+
+    Returns the numeric limit (1100000) or None if not found.
+    """
+    if not error_message:
+        return None
+
+    # Pattern: "maximum allowed per order: <number><token_symbol>"
+    # The number can have commas or be plain digits
+    patterns = [
+        r'maximum allowed per order:\s*([\d,]+)',  # "maximum allowed per order: 1100000"
+        r'less than.*?:\s*([\d,]+)',  # Fallback: "less than X: 1100000"
+        r'must be less than\s*([\d,]+)',  # Another variant
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, error_message, re.IGNORECASE)
+        if match:
+            # Remove commas and convert to float
+            qty_str = match.group(1).replace(',', '')
+            try:
+                return float(qty_str)
+            except ValueError:
+                continue
+
+    return None
 
 
 def format_price(price: float, min_significant: int = 3) -> str:
@@ -151,6 +187,9 @@ class RealOrderExecutorService:
         self._log = logger.bind(stream="trading", component="RealOrderExecutor")
         self._running = False
 
+        # Cache for max_market_qty learned from errors (symbol -> max_qty)
+        self._max_qty_cache: Dict[str, float] = {}
+
         # Statistics
         self._stats = {
             "orders_placed": 0,
@@ -204,6 +243,67 @@ class RealOrderExecutorService:
         except Exception as e:
             self._log.error("Failed to get price for {}: {}", symbol, e)
             return None
+
+    async def _get_stored_max_qty(self, symbol: str) -> Optional[float]:
+        """
+        Get stored max_market_qty from database for a symbol.
+
+        First checks in-memory cache, then queries database.
+        """
+        # Check cache first
+        if symbol in self._max_qty_cache:
+            return self._max_qty_cache[symbol]
+
+        try:
+            from db.models import Token
+
+            async with self._session_factory() as session:
+                stmt = select(Token.max_market_qty).where(Token.bybit_symbol == symbol)
+                result = await session.execute(stmt)
+                max_qty = result.scalar_one_or_none()
+
+                if max_qty:
+                    self._max_qty_cache[symbol] = max_qty
+                    self._log.debug("Loaded stored max_market_qty for {}: {}", symbol, max_qty)
+
+                return max_qty
+
+        except Exception as e:
+            self._log.error("Failed to get stored max_qty for {}: {}", symbol, e)
+            return None
+
+    async def _save_max_qty(self, symbol: str, max_qty: float) -> bool:
+        """
+        Save learned max_market_qty to database.
+
+        Updates the token record and refreshes the cache.
+        """
+        try:
+            from db.models import Token
+
+            async with self._session_factory() as session:
+                stmt = (
+                    update(Token)
+                    .where(Token.bybit_symbol == symbol)
+                    .values(max_market_qty=max_qty)
+                )
+                result = await session.execute(stmt)
+                await session.commit()
+
+                if result.rowcount > 0:
+                    self._max_qty_cache[symbol] = max_qty
+                    self._log.info(
+                        "Saved max_market_qty for {}: {} (learned from error)",
+                        symbol, max_qty
+                    )
+                    return True
+                else:
+                    self._log.warning("Token {} not found in DB, cannot save max_qty", symbol)
+                    return False
+
+        except Exception as e:
+            self._log.error("Failed to save max_qty for {}: {}", symbol, e)
+            return False
 
     def _calculate_order_chunks(
         self, total_quantity: float, max_qty: float, qty_step: str
@@ -303,9 +403,26 @@ class RealOrderExecutorService:
             else:
                 max_qty = max_limit_qty  # Use limit order limit
 
+            # If API doesn't provide max_qty, check our stored limit from previous errors
+            stored_max_qty = await self._get_stored_max_qty(symbol)
+            if max_qty is None and stored_max_qty:
+                max_qty = stored_max_qty
+                self._log.info(
+                    "Using stored max_market_qty for {}: {} (learned from previous error)",
+                    symbol, max_qty
+                )
+            elif max_qty is not None and stored_max_qty is not None:
+                # Use the smaller of the two to be safe
+                if stored_max_qty < max_qty:
+                    self._log.info(
+                        "Using stored max_qty {} instead of API max_qty {} for {}",
+                        stored_max_qty, max_qty, symbol
+                    )
+                    max_qty = stored_max_qty
+
             self._log.debug(
-                "Order limits for {}: qty_step={}, max_limit_qty={}, max_mkt_qty={}, using={} ({})",
-                symbol, qty_step, max_limit_qty, max_mkt_qty, max_qty,
+                "Order limits for {}: qty_step={}, max_limit_qty={}, max_mkt_qty={}, stored={}, using={} ({})",
+                symbol, qty_step, max_limit_qty, max_mkt_qty, stored_max_qty, max_qty,
                 "MARKET" if is_market_order else "LIMIT"
             )
 
@@ -377,6 +494,9 @@ class RealOrderExecutorService:
             total_quantity=sum(chunks),
             first_order_time=datetime.now(timezone.utc),
         )
+
+        # Track if we learned a new max_qty from errors
+        learned_max_qty: Optional[float] = None
 
         price_str = f"{price:.8f}".rstrip('0').rstrip('.') if price else None
 
@@ -472,6 +592,16 @@ class RealOrderExecutorService:
                         error_msg = completed_order.result.message
                     batch_result.errors.append(f"Order {i+1}: {error_msg}")
 
+                    # Try to parse max_qty from error message and save to DB
+                    parsed_max_qty = parse_max_qty_from_error(error_msg)
+                    if parsed_max_qty:
+                        learned_max_qty = parsed_max_qty
+                        self._log.info(
+                            "Learned max_market_qty from error for {}: {}",
+                            symbol, parsed_max_qty
+                        )
+                        await self._save_max_qty(symbol, parsed_max_qty)
+
                     # Save failed order to DB
                     if completed_order:
                         await self._save_order_to_db(
@@ -490,6 +620,16 @@ class RealOrderExecutorService:
                 batch_result.failed_quantity += chunk_qty
                 batch_result.errors.append(f"Order {i+1}: {str(e)}")
                 self._log.exception("Batch order {}/{} exception: {}", i + 1, len(chunks), e)
+
+                # Try to parse max_qty from exception message too
+                parsed_max_qty = parse_max_qty_from_error(str(e))
+                if parsed_max_qty:
+                    learned_max_qty = parsed_max_qty
+                    self._log.info(
+                        "Learned max_market_qty from exception for {}: {}",
+                        symbol, parsed_max_qty
+                    )
+                    await self._save_max_qty(symbol, parsed_max_qty)
 
         # Calculate average fill price
         if filled_prices:
@@ -523,6 +663,7 @@ class RealOrderExecutorService:
             "orders_failed": batch_result.orders_failed,
             "errors": batch_result.errors,
             "partial": batch_result.orders_failed > 0 and batch_result.orders_completed > 0,
+            "learned_max_qty": learned_max_qty,  # If set, we learned a new limit from errors
         }
 
     async def _save_order_to_db(
