@@ -293,9 +293,25 @@ class StrategyEngine:
             if not exit_triggered and ma14 is not None:
                 # Exit if price crosses MA14 from above
                 # We check: close <= ma14 OR low <= ma14
-                if update.close <= ma14 or update.low <= ma14:
+                close_crossed = update.close <= ma14
+                low_crossed = update.low <= ma14
+
+                if close_crossed or low_crossed:
                     exit_triggered = True
                     exit_reason = "ma14_crossover"
+
+                    # Log which value(s) crossed MA14
+                    if close_crossed and low_crossed:
+                        cross_detail = f"close={update.close:.6f} AND low={update.low:.6f}"
+                    elif close_crossed:
+                        cross_detail = f"close={update.close:.6f}"
+                    else:
+                        cross_detail = f"low={update.low:.6f}"
+
+                    self._log.info(
+                        "MA14 EXIT for %s: %s <= ma14=%.6f",
+                        update.symbol, cross_detail, ma14
+                    )
 
             if exit_triggered:
                 exit_signal = TradingSignal(
