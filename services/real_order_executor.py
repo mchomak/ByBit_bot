@@ -456,15 +456,65 @@ class RealOrderExecutorService:
                     side, symbol, quantity, max_qty
                 )
                 chunks = self._calculate_order_chunks(quantity, max_qty, qty_step)
-                return await self._execute_batch_order(
+                result = await self._execute_batch_order(
                     symbol, side, chunks, price, qty_step, context
                 )
             else:
                 # Single order
                 chunks = [quantity]
-                return await self._execute_batch_order(
+                result = await self._execute_batch_order(
                     symbol, side, chunks, price, qty_step, context
                 )
+
+            # If we learned a new max_qty and have failed quantity, retry with splitting
+            learned_max_qty = result.get("learned_max_qty")
+            failed_qty = result.get("failed_qty", 0)
+
+            if learned_max_qty and failed_qty > 0:
+                self._log.info(
+                    "Retrying failed order for {} with learned max_qty={}: failed_qty={}",
+                    symbol, learned_max_qty, failed_qty
+                )
+
+                # Split the failed quantity using the learned limit
+                retry_chunks = self._calculate_order_chunks(failed_qty, learned_max_qty, qty_step)
+
+                if retry_chunks:
+                    # Update context for retry (don't send duplicate notifications for partial success)
+                    retry_context = context.copy()
+                    retry_context["is_retry"] = True
+
+                    retry_result = await self._execute_batch_order(
+                        symbol, side, retry_chunks, price, qty_step, retry_context
+                    )
+
+                    # Merge results
+                    result["retry_result"] = retry_result
+                    result["filled_qty"] = result.get("filled_qty", 0) + retry_result.get("filled_qty", 0)
+                    result["failed_qty"] = retry_result.get("failed_qty", 0)
+                    result["orders_completed"] = result.get("orders_completed", 0) + retry_result.get("orders_completed", 0)
+                    result["orders_failed"] = retry_result.get("orders_failed", 0)
+                    result["order_ids"].extend(retry_result.get("order_ids", []))
+
+                    # Update success status
+                    if retry_result.get("success"):
+                        result["success"] = True
+                        # Recalculate average price
+                        total_filled = result["filled_qty"]
+                        if total_filled > 0:
+                            orig_value = (result.get("filled_qty", 0) - retry_result.get("filled_qty", 0)) * result.get("avg_price", 0)
+                            retry_value = retry_result.get("filled_qty", 0) * retry_result.get("avg_price", 0)
+                            result["avg_price"] = (orig_value + retry_value) / total_filled
+
+                    self._log.info(
+                        "Retry complete for {}: filled={}/{}, orders={}",
+                        symbol, result["filled_qty"], quantity, result["orders_completed"]
+                    )
+
+                    # Send consolidated notification after retry
+                    await self._send_retry_notification(result, context)
+
+            return result
 
         except Exception as e:
             self._log.exception("Error placing order: {}", e)
@@ -641,7 +691,9 @@ class RealOrderExecutorService:
         batch_result.success = batch_result.orders_completed > 0
 
         # Send consolidated Telegram notification
-        await self._send_batch_notification(batch_result, context)
+        # Skip if we learned a max_qty - caller will retry and send final notification
+        if not learned_max_qty:
+            await self._send_batch_notification(batch_result, context)
 
         # Log summary
         self._log.info(
@@ -705,6 +757,10 @@ class RealOrderExecutorService:
     ) -> None:
         """Send consolidated Telegram notification after batch completes."""
         if not self._telegram_queue:
+            return
+
+        # Skip notifications for retry batches - caller will send consolidated notification
+        if context.get("is_retry"):
             return
 
         try:
@@ -821,6 +877,100 @@ class RealOrderExecutorService:
             self._log.warning("Telegram queue full, error notification dropped")
         except Exception as e:
             self._log.error("Failed to send error notification: {}", e)
+
+    async def _send_retry_notification(
+        self,
+        result: Dict[str, Any],
+        context: Dict[str, Any],
+    ) -> None:
+        """Send notification after retry with learned max_qty."""
+        if not self._telegram_queue:
+            return
+
+        try:
+            current_time = datetime.now().strftime("%H:%M:%S")
+            symbol = context.get("symbol", "")
+            side = context.get("side", "")
+            coin = symbol.replace("USDT", "").replace("USDC", "")
+
+            filled_qty = result.get("filled_qty", 0)
+            failed_qty = result.get("failed_qty", 0)
+            avg_price = result.get("avg_price", 0)
+            orders_completed = result.get("orders_completed", 0)
+            orders_failed = result.get("orders_failed", 0)
+            learned_max_qty = result.get("learned_max_qty", 0)
+
+            price_formatted = format_price(avg_price) if avg_price else "N/A"
+
+            if result.get("success") and filled_qty > 0:
+                # Successful after retry
+                position_size = filled_qty * avg_price
+
+                if side.lower() == "buy":
+                    msg = (
+                        f"🟢 <b>Вход в позицию</b> (после повтора)\n\n"
+                        f"Монета: <b>{coin}</b>\n"
+                        f"Цена: {price_formatted}\n"
+                        f"Количество: {filled_qty:.4f}\n"
+                        f"Размер: ${position_size:.2f}\n"
+                        f"Ордеров: {orders_completed}\n"
+                        f"Лимит: {learned_max_qty:.0f}\n"
+                        f"Время: {current_time}"
+                    )
+                else:
+                    pnl_pct = context.get("expected_pnl_pct") or 0
+                    profit_sign = "+" if pnl_pct >= 0 else ""
+                    exit_value = filled_qty * avg_price
+                    msg = (
+                        f"🔴 <b>Выход из позиции</b> (после повтора)\n\n"
+                        f"Монета: <b>{coin}</b>\n"
+                        f"Цена: {price_formatted}\n"
+                        f"Сумма: ${exit_value:.2f}\n"
+                        f"Результат: {profit_sign}{pnl_pct:.1f}%\n"
+                        f"Ордеров: {orders_completed}\n"
+                        f"Время: {current_time}"
+                    )
+
+                should_broadcast = True
+            elif filled_qty > 0:
+                # Partial success
+                action = "Покупка" if side.lower() == "buy" else "Продажа"
+                filled_value = filled_qty * avg_price
+                msg = (
+                    f"⚠️ <b>{action} выполнена частично</b> (после повтора)\n\n"
+                    f"Монета: <b>{coin}</b>\n"
+                    f"Выполнено: {filled_qty:.4f} (${filled_value:.2f})\n"
+                    f"Не выполнено: {failed_qty:.4f}\n"
+                    f"Ордеров: {orders_completed}/{orders_completed + orders_failed}\n"
+                    f"Лимит: {learned_max_qty:.0f}\n"
+                    f"Время: {current_time}"
+                )
+                should_broadcast = True
+            else:
+                # Complete failure even after retry
+                action = "Покупка" if side.lower() == "buy" else "Продажа"
+                total_qty = context.get("quantity", 0)
+                errors = result.get("errors", [])
+                msg = (
+                    f"❌ <b>{action} не выполнена</b> (после повтора)\n\n"
+                    f"Монета: <b>{coin}</b>\n"
+                    f"Количество: {total_qty:.4f}\n"
+                    f"Лимит: {learned_max_qty:.0f}\n"
+                    f"Ошибки: {'; '.join(errors[:2])}\n"
+                    f"Время: {current_time}"
+                )
+                should_broadcast = False
+
+            self._telegram_queue.put_nowait({
+                "text": msg,
+                "parse_mode": "HTML",
+                "broadcast": should_broadcast
+            })
+
+        except asyncio.QueueFull:
+            self._log.warning("Telegram queue full, retry notification dropped")
+        except Exception as e:
+            self._log.error("Failed to send retry notification: {}", e)
 
     def get_stats(self) -> Dict[str, Any]:
         """Get executor statistics."""

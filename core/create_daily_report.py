@@ -20,6 +20,9 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from db.models import Order, Position, Token, OrderSide, OrderStatus, PositionStatus
 
+# Default timezone offset for reports (Moscow time = UTC+3)
+DEFAULT_REPORT_TZ_OFFSET_HOURS = 3
+
 
 class DailyReportService:
     """
@@ -32,7 +35,7 @@ class DailyReportService:
         self,
         session_factory: sessionmaker,
         telegram_queue: asyncio.Queue,
-        timezone_str: str = "UTC",
+        timezone_offset_hours: int = DEFAULT_REPORT_TZ_OFFSET_HOURS,
     ):
         """
         Initialize the daily report service.
@@ -40,11 +43,12 @@ class DailyReportService:
         Args:
             session_factory: SQLAlchemy async session factory
             telegram_queue: Queue for sending Telegram messages
-            timezone_str: Timezone string (default: UTC)
+            timezone_offset_hours: Timezone offset in hours (default: +3 for Moscow)
         """
         self._session_factory = session_factory
         self._telegram_queue = telegram_queue
-        self._timezone_str = timezone_str
+        self._tz_offset = timezone(timedelta(hours=timezone_offset_hours))
+        self._tz_offset_hours = timezone_offset_hours
         self._task: Optional[asyncio.Task] = None
         self._stop_event = asyncio.Event()
         self._log = logger.bind(component="DailyReport")
@@ -60,7 +64,10 @@ class DailyReportService:
             self._scheduler_loop(),
             name="daily-report-scheduler"
         )
-        self._log.info("Daily report scheduler started (runs at 00:00 UTC)")
+        self._log.info(
+            "Daily report scheduler started (runs at 00:00 UTC+{})",
+            self._tz_offset_hours
+        )
 
     async def stop(self) -> None:
         """Stop the daily report scheduler."""
@@ -75,18 +82,21 @@ class DailyReportService:
         self._log.info("Daily report scheduler stopped")
 
     async def _scheduler_loop(self) -> None:
-        """Main scheduler loop - runs report at 00:00 UTC daily."""
+        """Main scheduler loop - runs report at 00:00 in configured timezone daily."""
         while not self._stop_event.is_set():
             try:
-                # Calculate time until next 00:00 UTC
-                now = datetime.now(timezone.utc)
-                tomorrow = now.date() + timedelta(days=1)
-                next_midnight = datetime.combine(tomorrow, time.min, tzinfo=timezone.utc)
-                wait_seconds = (next_midnight - now).total_seconds()
+                # Calculate time until next 00:00 in configured timezone
+                now_local = datetime.now(self._tz_offset)
+                tomorrow_local = now_local.date() + timedelta(days=1)
+                next_midnight_local = datetime.combine(
+                    tomorrow_local, time.min, tzinfo=self._tz_offset
+                )
+                wait_seconds = (next_midnight_local - now_local).total_seconds()
 
                 self._log.debug(
-                    "Next daily report in {:.1f} hours",
-                    wait_seconds / 3600
+                    "Next daily report in {:.1f} hours (at 00:00 UTC+{})",
+                    wait_seconds / 3600,
+                    self._tz_offset_hours
                 )
 
                 # Wait until midnight (or stop event)
@@ -101,7 +111,7 @@ class DailyReportService:
                     # Time to run the report
                     pass
 
-                # Generate and send report
+                # Generate and send report for yesterday in local timezone
                 await self.generate_and_send_report()
 
             except asyncio.CancelledError:
@@ -115,17 +125,30 @@ class DailyReportService:
         Generate and send the daily report.
 
         Args:
-            report_date: Date to report on (default: yesterday)
+            report_date: Date to report on (default: yesterday in local timezone)
         """
         try:
-            # Default to yesterday
+            # Default to yesterday in local timezone
             if report_date is None:
-                report_date = datetime.now(timezone.utc).date() - timedelta(days=1)
+                now_local = datetime.now(self._tz_offset)
+                report_date = now_local.date() - timedelta(days=1)
 
-            start_dt = datetime.combine(report_date, time.min, tzinfo=timezone.utc)
-            end_dt = start_dt + timedelta(days=1)
+            # Create date range in local timezone, then convert to UTC for DB query
+            start_local = datetime.combine(report_date, time.min, tzinfo=self._tz_offset)
+            end_local = start_local + timedelta(days=1)
 
-            self._log.info("Generating daily report for {}", report_date)
+            # Convert to UTC for database queries (PostgreSQL stores with timezone)
+            start_dt = start_local.astimezone(timezone.utc)
+            end_dt = end_local.astimezone(timezone.utc)
+
+            self._log.info(
+                "Generating daily report for {} (local: {} to {}, UTC: {} to {})",
+                report_date,
+                start_local.strftime("%Y-%m-%d %H:%M %Z"),
+                end_local.strftime("%Y-%m-%d %H:%M %Z"),
+                start_dt.strftime("%Y-%m-%d %H:%M UTC"),
+                end_dt.strftime("%Y-%m-%d %H:%M UTC")
+            )
 
             async with self._session_factory() as session:
                 # 1. Get order statistics
@@ -288,6 +311,10 @@ class DailyReportService:
         total_trades = profit_stats["winning_trades"] + profit_stats["losing_trades"]
         win_rate = (profit_stats["winning_trades"] / total_trades * 100) if total_trades > 0 else 0
 
+        # Format timezone
+        tz_sign = "+" if self._tz_offset_hours >= 0 else ""
+        tz_str = f"UTC{tz_sign}{self._tz_offset_hours}"
+
         report = (
             f"<b>📊 Ежедневный отчёт - {report_date}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -306,7 +333,7 @@ class DailyReportService:
 
             f"<b>🪙 Активных токенов:</b> <b>{active_tokens}</b>\n\n"
 
-            f"<i>Отчёт сформирован в {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC</i>"
+            f"<i>Отчёт сформирован в {datetime.now(self._tz_offset).strftime('%H:%M:%S')} {tz_str}</i>"
         )
 
         return report
@@ -315,7 +342,8 @@ class DailyReportService:
 async def generate_daily_report(
     session_factory: sessionmaker,
     telegram_queue: asyncio.Queue,
-    report_date: datetime = None
+    report_date: datetime = None,
+    timezone_offset_hours: int = DEFAULT_REPORT_TZ_OFFSET_HOURS
 ) -> None:
     """
     Convenience function to generate a one-time daily report.
@@ -323,7 +351,10 @@ async def generate_daily_report(
     Args:
         session_factory: SQLAlchemy async session factory
         telegram_queue: Queue for sending Telegram messages
-        report_date: Date to report on (default: yesterday)
+        report_date: Date to report on (default: yesterday in local timezone)
+        timezone_offset_hours: Timezone offset in hours (default: +3 for Moscow)
     """
-    service = DailyReportService(session_factory, telegram_queue)
+    service = DailyReportService(
+        session_factory, telegram_queue, timezone_offset_hours
+    )
     await service.generate_and_send_report(report_date)
