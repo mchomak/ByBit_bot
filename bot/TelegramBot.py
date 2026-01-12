@@ -462,7 +462,6 @@ class TelegramBot:
                                 f"Монета: <b>{coin}</b>\n"
                                 f"Цена: {price_formatted}\n"
                                 f"Ваш размер: <b>${user_position_usdt:.2f}</b>\n"
-                                f"Ваша доля: {share_pct:.2f}%\n"
                                 f"Время: {trade_time}"
                             )
                         else:

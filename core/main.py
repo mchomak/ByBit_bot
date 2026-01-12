@@ -305,25 +305,25 @@ class TradingBot:
         assert self._db is not None
 
         # Check existing tokens
-        tokens = await self._repository.get_all(
-            Token,
-            filters={"is_active": True},
-            limit=settings.max_symbols if settings.max_symbols > 0 else None
-        )
+        # tokens = await self._repository.get_all(
+        #     Token,
+        #     filters={"is_active": True},
+        #     limit=settings.max_symbols if settings.max_symbols > 0 else None
+        # )
 
-        if tokens:
-            logger.info("Loaded %d active tokens from database", len(tokens))
-            # Filter by current category
-            category = settings.bybit_category.lower()
-            symbols = [
-                t.bybit_symbol for t in tokens
-                if t.bybit_categories and category in t.bybit_categories.lower()
-            ]
-            logger.info("Filtered to %d symbols for category '%s'", len(symbols), category)
-            return symbols
+        # if tokens:
+        #     logger.info("Loaded %d active tokens from database", len(tokens))
+        #     # Filter by current category
+        #     category = settings.bybit_category.lower()
+        #     symbols = [
+        #         t.bybit_symbol for t in tokens
+        #         if t.bybit_categories and category in t.bybit_categories.lower()
+        #     ]
+        #     logger.info("Filtered to %d symbols for category '%s'", len(symbols), category)
+        #     return symbols
 
-        # No tokens - run initial sync
-        logger.info("No tokens in database, running initial sync...")
+        # # No tokens - run initial sync
+        # logger.info("No tokens in database, running initial sync...")
 
         self._token_sync_service = TokenSyncService(
             repository=self._repository,
