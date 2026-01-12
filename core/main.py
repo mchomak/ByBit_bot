@@ -598,6 +598,16 @@ class TradingBot:
                 profit_sign = "+" if profit_pct >= 0 else ""
                 self._trading_log.info("EXIT EXECUTED: {} @ {} | P&L: {}{:.2f}%", coin, signal.price, profit_sign, profit_pct)
 
+                # Disable token if loss exceeds threshold (> 1%)
+                if profit_pct < self._execution_engine._disable_loss_threshold_pct:
+                    self._execution_engine.disable_token(signal.symbol, profit_pct)
+                    await self._notify(
+                        f"⛔ <b>Токен {coin} отключён</b>\n"
+                        f"Причина: убыток {profit_pct:.2f}%\n"
+                        f"До следующего обновления токенов",
+                        notify_type="trade"
+                    )
+
                 # Update user deposits based on trade profit (proportional to share)
                 if self._telegram_bot and self._db:
                     try:
@@ -686,6 +696,12 @@ class TradingBot:
 
                 # Run sync
                 logger.info("Starting scheduled token sync...")
+
+                # Clear disabled tokens - give them another chance
+                if self._execution_engine:
+                    cleared = self._execution_engine.clear_disabled_tokens()
+                    if cleared > 0:
+                        logger.info("Cleared %d disabled tokens during sync", cleared)
 
                 if self._token_sync_service and self._repository:
                     try:

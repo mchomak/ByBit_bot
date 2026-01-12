@@ -106,6 +106,11 @@ class ExecutionEngine:
         self._exit_cooldown_minutes = 5  # Wait 5 minutes between exit retry attempts
         self._max_exit_failures = 3  # After 3 failures, mark position as stuck
 
+        # Track temporarily disabled tokens (cleared on daily token sync)
+        # Tokens are disabled when closed with loss > threshold
+        self._disabled_tokens: Set[str] = set()
+        self._disable_loss_threshold_pct = -1.0  # Disable if loss exceeds 1%
+
         # Task handle
         self._task: Optional[asyncio.Task] = None
         self._stop_event = asyncio.Event()
@@ -259,13 +264,22 @@ class ExecutionEngine:
         """Handle an entry signal."""
         symbol = signal.symbol
 
-        # Gate check 1: Already have position for this symbol?
+        # Gate check 1: Token temporarily disabled (lost > 1% recently)?
+        if symbol in self._disabled_tokens:
+            self._log.info(
+                "Skipping entry for %s: token disabled due to recent loss",
+                symbol
+            )
+            await self._update_signal_execution(signal, False, "Token disabled (recent loss)")
+            return
+
+        # Gate check 2: Already have position for this symbol?
         if symbol in self._open_positions:
             self._log.info("Skipping entry for %s: already have open position", symbol)
             await self._update_signal_execution(signal, False, "Already have open position")
             return
 
-        # Gate check 2: Max positions reached?
+        # Gate check 3: Max positions reached?
         if len(self._open_positions) >= self._max_positions:
             self._log.info(
                 "Skipping entry for %s: max positions reached (%d/%d)",
@@ -274,7 +288,7 @@ class ExecutionEngine:
             await self._update_signal_execution(signal, False, "Max positions reached")
             return
 
-        # Gate check 3: Already entered this minute?
+        # Gate check 4: Already entered this minute?
         minute_key = (symbol, signal.timestamp)
         if minute_key in self._entry_minutes:
             self._log.info("Skipping entry for %s: already entered this minute", symbol)
@@ -767,3 +781,43 @@ class ExecutionEngine:
 
         except Exception as e:
             self._log.debug("Failed to update signal execution: %s", e)
+
+    def disable_token(self, symbol: str, loss_pct: float) -> None:
+        """
+        Temporarily disable a token from trading.
+
+        Called when a position closes with significant loss (> threshold).
+        Token remains disabled until daily token sync clears the list.
+
+        Args:
+            symbol: Token symbol to disable
+            loss_pct: Percentage loss (negative value)
+        """
+        self._disabled_tokens.add(symbol)
+        self._log.warning(
+            "Token %s DISABLED for trading (loss: %.2f%%, threshold: %.2f%%)",
+            symbol, loss_pct, self._disable_loss_threshold_pct
+        )
+
+    def clear_disabled_tokens(self) -> int:
+        """
+        Clear all temporarily disabled tokens.
+
+        Called during daily token sync to give tokens another chance.
+
+        Returns:
+            Number of tokens that were cleared
+        """
+        count = len(self._disabled_tokens)
+        if count > 0:
+            symbols = list(self._disabled_tokens)
+            self._disabled_tokens.clear()
+            self._log.info(
+                "Cleared %d disabled tokens: %s",
+                count, ", ".join(symbols)
+            )
+        return count
+
+    def get_disabled_tokens(self) -> Set[str]:
+        """Get the set of currently disabled tokens."""
+        return self._disabled_tokens.copy()
