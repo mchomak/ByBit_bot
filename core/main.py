@@ -120,7 +120,6 @@ class TradingBot:
             # 4. Run initial token sync or load existing tokens
             symbols = await self._init_tokens()
             logger.info(f"Trading symbols: {len(symbols)}")
-
             if not symbols:
                 logger.error("No symbols to trade. Check token sync configuration.")
                 await self._notify("Нет символов для торговли. Бот останавливается.", notify_type="error")
@@ -306,22 +305,22 @@ class TradingBot:
         assert self._db is not None
 
         # Check existing tokens
-        # tokens = await self._repository.get_all(
-        #     Token,
-        #     filters={"is_active": True},
-        #     limit=settings.max_symbols if settings.max_symbols > 0 else None
-        # )
+        tokens = await self._repository.get_all(
+            Token,
+            filters={"is_active": True},
+            limit=settings.max_symbols if settings.max_symbols > 0 else None
+        )
 
-        # if tokens:
-        #     logger.info("Loaded %d active tokens from database", len(tokens))
-        #     # Filter by current category
-        #     category = settings.bybit_category.lower()
-        #     symbols = [
-        #         t.bybit_symbol for t in tokens
-        #         if t.bybit_categories and category in t.bybit_categories.lower()
-        #     ]
-        #     logger.info("Filtered to %d symbols for category '%s'", len(symbols), category)
-        #     return symbols
+        if tokens:
+            logger.info("Loaded %d active tokens from database", len(tokens))
+            # Filter by current category
+            category = settings.bybit_category.lower()
+            symbols = [
+                t.bybit_symbol for t in tokens
+                if t.bybit_categories and category in t.bybit_categories.lower()
+            ]
+            logger.info("Filtered to %d symbols for category '%s'", len(symbols), category)
+            return symbols
 
         # No tokens - run initial sync
         logger.info("No tokens in database, running initial sync...")
@@ -599,6 +598,16 @@ class TradingBot:
                 profit_sign = "+" if profit_pct >= 0 else ""
                 self._trading_log.info("EXIT EXECUTED: {} @ {} | P&L: {}{:.2f}%", coin, signal.price, profit_sign, profit_pct)
 
+                # Disable token if loss exceeds threshold (> 1%)
+                if profit_pct < self._execution_engine._disable_loss_threshold_pct:
+                    self._execution_engine.disable_token(signal.symbol, profit_pct)
+                    await self._notify(
+                        f"⛔ <b>Токен {coin} отключён</b>\n"
+                        f"Причина: убыток {profit_pct:.2f}%\n"
+                        f"До следующего обновления токенов",
+                        notify_type="trade"
+                    )
+
                 # Update user deposits based on trade profit (proportional to share)
                 if self._telegram_bot and self._db:
                     try:
@@ -687,6 +696,12 @@ class TradingBot:
 
                 # Run sync
                 logger.info("Starting scheduled token sync...")
+
+                # Clear disabled tokens - give them another chance
+                if self._execution_engine:
+                    cleared = self._execution_engine.clear_disabled_tokens()
+                    if cleared > 0:
+                        logger.info("Cleared %d disabled tokens during sync", cleared)
 
                 if self._token_sync_service and self._repository:
                     try:

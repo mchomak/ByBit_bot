@@ -1,8 +1,9 @@
 """TelegramBot: Full-featured Telegram bot with commands and notifications."""
 
 import asyncio
+import math
 from datetime import datetime
-from typing import Optional, Callable, Awaitable
+from typing import Optional, Callable, Awaitable, Dict, Any
 
 from aiogram import Bot, Dispatcher, Router
 from aiogram.client.bot import DefaultBotProperties
@@ -13,6 +14,27 @@ from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import sessionmaker
+
+
+def format_price(price: float, min_significant: int = 3) -> str:
+    """
+    Format price with enough decimal places to show significant digits.
+    """
+    if price == 0:
+        return "0.000000"
+
+    if price >= 0.000001:
+        formatted = f"{price:.6f}"
+        if float(formatted) != 0:
+            return formatted
+
+    abs_price = abs(price)
+    if abs_price >= 1:
+        return f"{price:.6f}"
+
+    decimals_needed = int(-math.log10(abs_price)) + min_significant
+    decimals_needed = max(6, min(decimals_needed, 15))
+    return f"{price:.{decimals_needed}f}"
 
 
 class TelegramBot:
@@ -279,16 +301,19 @@ class TelegramBot:
                         parse_mode = msg.get("parse_mode", "HTML")
                         chat_id = msg.get("chat_id", self.chat_id)
                         broadcast = msg.get("broadcast", False)
+                        trade_data = msg.get("trade_data")
 
-                        # Send to main chat
+                        # Send to main chat (full position info)
                         await self.bot.send_message(
                             chat_id=chat_id,
                             text=text,
                             parse_mode=parse_mode
                         )
 
-                        # Broadcast to all users if requested
-                        if broadcast:
+                        # Broadcast personalized messages to users
+                        if broadcast and trade_data:
+                            await self._broadcast_personalized(trade_data, parse_mode)
+                        elif broadcast:
                             await self._broadcast_to_users(text, parse_mode)
                     else:
                         await self.bot.send_message(
@@ -365,6 +390,119 @@ class TelegramBot:
 
         except Exception as e:
             self.logger.error("Broadcast error: {}", e)
+
+    async def _broadcast_personalized(
+        self,
+        trade_data: Dict[str, Any],
+        parse_mode: str = "HTML"
+    ) -> None:
+        """
+        Send personalized trade notifications to users based on their share_pct.
+
+        Each user receives a message with their portion of the position size,
+        calculated as: user_size = total_size * (share_pct / 100)
+
+        Args:
+            trade_data: Dict containing trade info:
+                - type: "entry" or "exit"
+                - coin: Token symbol (e.g., "BTC")
+                - price: Execution price
+                - quantity: Total quantity traded
+                - position_size_usdt: Total position size in USDT
+                - pnl_pct: Profit/loss percentage (for exit)
+                - orders_count: Number of orders executed
+                - time: Execution time string
+                - is_retry: Whether this was a retry (optional)
+            parse_mode: Telegram parse mode
+        """
+        try:
+            async with self._session_factory() as session:
+                # Get all users with deposits (active investors)
+                result = await session.execute(
+                    select(self._user_model).where(
+                        self._user_model.deposit > 0
+                    )
+                )
+                users = result.scalars().all()
+
+                if not users:
+                    return
+
+                sent_count = 0
+                failed_count = 0
+
+                trade_type = trade_data.get("type", "entry")
+                coin = trade_data.get("coin", "")
+                price = trade_data.get("price", 0)
+                total_position_usdt = trade_data.get("position_size_usdt", 0)
+                pnl_pct = trade_data.get("pnl_pct", 0)
+                trade_time = trade_data.get("time", "")
+                is_retry = trade_data.get("is_retry", False)
+
+                price_formatted = format_price(price)
+                retry_suffix = " (после повтора)" if is_retry else ""
+
+                for user in users:
+                    try:
+                        # Don't send to main chat again (already sent)
+                        if str(user.telegram_id) == str(self.chat_id):
+                            continue
+
+                        # Calculate user's portion based on share_pct
+                        share_pct = getattr(user, 'share_pct', 0.0) or 0.0
+                        if share_pct <= 0:
+                            continue
+
+                        user_position_usdt = total_position_usdt * (share_pct / 100.0)
+
+                        # Generate personalized message
+                        if trade_type == "entry":
+                            msg = (
+                                f"🟢 <b>Вход в позицию</b>{retry_suffix}\n\n"
+                                f"Монета: <b>{coin}</b>\n"
+                                f"Цена: {price_formatted}\n"
+                                f"Ваш размер: <b>${user_position_usdt:.2f}</b>\n"
+                                f"Ваша доля: {share_pct:.2f}%\n"
+                                f"Время: {trade_time}"
+                            )
+                        else:
+                            profit_sign = "+" if pnl_pct >= 0 else ""
+                            user_pnl_usdt = user_position_usdt * (pnl_pct / 100.0) if pnl_pct else 0
+                            pnl_sign_usdt = "+" if user_pnl_usdt >= 0 else ""
+                            msg = (
+                                f"🔴 <b>Выход из позиции</b>{retry_suffix}\n\n"
+                                f"Монета: <b>{coin}</b>\n"
+                                f"Цена: {price_formatted}\n"
+                                f"Ваша сумма: <b>${user_position_usdt:.2f}</b>\n"
+                                f"Ваш результат: <b>{profit_sign}{pnl_pct:.1f}%</b> ({pnl_sign_usdt}${abs(user_pnl_usdt):.2f})\n"
+                                f"Время: {trade_time}"
+                            )
+
+                        await self.bot.send_message(
+                            chat_id=user.telegram_id,
+                            text=msg,
+                            parse_mode=parse_mode
+                        )
+                        sent_count += 1
+
+                        # Small delay to avoid rate limiting
+                        await asyncio.sleep(0.1)
+
+                    except TelegramAPIError as e:
+                        self.logger.warning(
+                            "Failed to send personalized msg to user {}: {}",
+                            user.telegram_id, e
+                        )
+                        failed_count += 1
+
+                if sent_count > 0 or failed_count > 0:
+                    self.logger.info(
+                        "Personalized broadcast complete: sent={}, failed={}",
+                        sent_count, failed_count
+                    )
+
+        except Exception as e:
+            self.logger.error("Personalized broadcast error: {}", e)
 
     async def stop(self) -> None:
         """Stop the bot gracefully."""

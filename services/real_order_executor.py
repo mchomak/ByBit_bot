@@ -854,11 +854,28 @@ class RealOrderExecutorService:
 
             # Broadcast trade notifications to all users (not errors)
             should_broadcast = batch.orders_completed > 0
-            self._telegram_queue.put_nowait({
+
+            # For personalized broadcasts, include trade data
+            notification_data = {
                 "text": msg,
                 "parse_mode": "HTML",
-                "broadcast": should_broadcast
-            })
+                "broadcast": should_broadcast,
+            }
+
+            if should_broadcast:
+                # Add trade data for personalized messages
+                notification_data["trade_data"] = {
+                    "type": "entry" if side.lower() == "buy" else "exit",
+                    "coin": coin,
+                    "price": batch.avg_price,
+                    "quantity": batch.filled_quantity,
+                    "position_size_usdt": batch.filled_quantity * batch.avg_price,
+                    "pnl_pct": context.get("expected_pnl_pct") or 0,
+                    "orders_count": batch.orders_completed,
+                    "time": current_time,
+                }
+
+            self._telegram_queue.put_nowait(notification_data)
 
         except asyncio.QueueFull:
             self._log.warning("Telegram queue full, notification dropped")
@@ -961,11 +978,27 @@ class RealOrderExecutorService:
                 )
                 should_broadcast = False
 
-            self._telegram_queue.put_nowait({
+            # For personalized broadcasts, include trade data
+            notification_data = {
                 "text": msg,
                 "parse_mode": "HTML",
-                "broadcast": should_broadcast
-            })
+                "broadcast": should_broadcast,
+            }
+
+            if should_broadcast and filled_qty > 0:
+                notification_data["trade_data"] = {
+                    "type": "entry" if side.lower() == "buy" else "exit",
+                    "coin": coin,
+                    "price": avg_price,
+                    "quantity": filled_qty,
+                    "position_size_usdt": filled_qty * avg_price,
+                    "pnl_pct": context.get("expected_pnl_pct") or 0,
+                    "orders_count": orders_completed,
+                    "time": current_time,
+                    "is_retry": True,
+                }
+
+            self._telegram_queue.put_nowait(notification_data)
 
         except asyncio.QueueFull:
             self._log.warning("Telegram queue full, retry notification dropped")
