@@ -216,6 +216,9 @@ async def sync_tokens_to_database(
         synced_symbols: Set[str] = set()
         tokens_to_sync = []
 
+        # Track filtered tokens with reasons for deactivation
+        filtered_tokens: Dict[str, str] = {}  # symbol -> reason
+
         blacklisted_count = 0
         st_filtered_count = 0
         for t in candidates:
@@ -228,12 +231,14 @@ async def sync_tokens_to_database(
             # Skip blacklisted tokens
             if normalized_symbol.upper() in blacklisted_symbols:
                 blacklisted_count += 1
+                filtered_tokens[normalized_symbol] = "Blacklist"
                 log.debug(f"Skipping blacklisted token: {normalized_symbol}")
                 continue
 
             # Skip ST (Special Treatment) tokens
             if normalized_symbol.upper() in st_tokens:
                 st_filtered_count += 1
+                filtered_tokens[normalized_symbol] = "ST"
                 log.debug(f"Skipping ST token: {normalized_symbol}")
                 continue
 
@@ -293,10 +298,11 @@ async def sync_tokens_to_database(
                     f"{sorted(list(stale_symbols)[:10])}{'...' if len(stale_symbols) > 10 else ''}"
                 )
 
-                # Also remove from synced_symbols
+                # Also remove from synced_symbols and track reason
                 for symbol in list(synced_symbols):
                     if f"{symbol}USDT" in stale_symbols:
                         synced_symbols.discard(symbol)
+                        filtered_tokens[symbol] = "StalePrice"
 
         # Сортируем по market cap (от большего к меньшему)
         tokens_to_sync.sort(key=lambda x: x["market_cap_usd"], reverse=True)
@@ -313,6 +319,7 @@ async def sync_tokens_to_database(
                     "market_cap_usd": token_data["market_cap_usd"],
                     "bybit_categories": token_data["bybit_categories"],
                     "is_active": True,
+                    "deactivation_reason": None,  # Clear reason when activating
                 }
             )
 
@@ -328,26 +335,35 @@ async def sync_tokens_to_database(
         blacklisted_deactivated = 0
         for token in active_tokens:
             should_deactivate = False
-            reason = ""
+            deactivation_reason = None
 
-            # Check if in blacklist
-            if token.symbol.upper() in blacklisted_symbols:
+            # Check if filtered with a specific reason
+            if token.symbol in filtered_tokens:
                 should_deactivate = True
-                reason = "blacklisted"
+                deactivation_reason = filtered_tokens[token.symbol]
+                if deactivation_reason == "Blacklist":
+                    blacklisted_deactivated += 1
+            # Check if in blacklist (double-check by uppercase)
+            elif token.symbol.upper() in blacklisted_symbols:
+                should_deactivate = True
+                deactivation_reason = "Blacklist"
                 blacklisted_deactivated += 1
-            # Check if no longer in sync list
+            # Check if no longer in sync list (low mcap or not on Bybit)
             elif token.symbol not in synced_symbols:
                 should_deactivate = True
-                reason = "not tradable"
+                deactivation_reason = "LowMcap"  # Most likely reason
 
             if should_deactivate:
                 await repository.enqueue_update(
                     model=Token,
                     filter_by={"symbol": token.symbol},
-                    update_values={"is_active": False}
+                    update_values={
+                        "is_active": False,
+                        "deactivation_reason": deactivation_reason,
+                    }
                 )
                 tokens_to_deactivate += 1
-                log.debug(f"Deactivating token {token.symbol}: {reason}")
+                log.debug(f"Deactivating token {token.symbol}: {deactivation_reason}")
 
         if tokens_to_deactivate > 0:
             log.info(

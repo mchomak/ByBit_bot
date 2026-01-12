@@ -370,6 +370,7 @@ class TradingBot:
 
         Checks the earliest candle timestamp for each symbol.
         Tokens with less than 24h of history are skipped until next sync.
+        Updates deactivation_reason in DB for filtered tokens.
 
         Args:
             symbols: List of symbols to filter
@@ -390,7 +391,7 @@ class TradingBot:
         skipped_symbols = []
 
         async with self._db.session_factory() as session:
-            from sqlalchemy import func, select
+            from sqlalchemy import func, select, update
 
             for symbol in symbols:
                 try:
@@ -422,6 +423,21 @@ class TradingBot:
                     logger.warning("Error checking history for %s: %s", symbol, e)
                     # Include token on error to avoid accidentally excluding valid tokens
                     filtered_symbols.append(symbol)
+
+            # Update deactivation_reason for skipped (new) tokens
+            if skipped_symbols:
+                for bybit_symbol, _ in skipped_symbols:
+                    try:
+                        stmt = (
+                            update(Token)
+                            .where(Token.bybit_symbol == bybit_symbol)
+                            .values(deactivation_reason="New")
+                        )
+                        await session.execute(stmt)
+                    except Exception as e:
+                        logger.debug("Failed to update deactivation_reason for %s: %s", bybit_symbol, e)
+
+                await session.commit()
 
         if skipped_symbols:
             logger.info(
