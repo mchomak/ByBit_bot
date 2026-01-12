@@ -320,6 +320,10 @@ class TradingBot:
                 if t.bybit_categories and category in t.bybit_categories.lower()
             ]
             logger.info("Filtered to %d symbols for category '%s'", len(symbols), category)
+
+            # Filter out tokens that appeared less than 24h ago
+            symbols = await self._filter_new_tokens(symbols)
+
             return symbols
 
         # No tokens - run initial sync
@@ -355,7 +359,86 @@ class TradingBot:
             if t.bybit_categories and category in t.bybit_categories.lower()
         ]
 
+        # Filter out tokens that appeared less than 24h ago
+        symbols = await self._filter_new_tokens(symbols)
+
         return symbols
+
+    async def _filter_new_tokens(self, symbols: List[str]) -> List[str]:
+        """
+        Filter out tokens that appeared on the exchange less than 24 hours ago.
+
+        Checks the earliest candle timestamp for each symbol.
+        Tokens with less than 24h of history are skipped until next sync.
+
+        Args:
+            symbols: List of symbols to filter
+
+        Returns:
+            Filtered list with new tokens removed
+        """
+        if not symbols:
+            return symbols
+
+        assert self._db is not None
+
+        min_history_hours = 24
+        now = datetime.now(pytz.UTC)
+        min_first_candle_time = now - timedelta(hours=min_history_hours)
+
+        filtered_symbols = []
+        skipped_symbols = []
+
+        async with self._db.session_factory() as session:
+            from sqlalchemy import func, select
+
+            for symbol in symbols:
+                try:
+                    # Get the earliest candle timestamp for this symbol
+                    stmt = select(func.min(Candle1m.timestamp)).where(
+                        Candle1m.symbol == symbol
+                    )
+                    result = await session.execute(stmt)
+                    first_candle_time = result.scalar()
+
+                    if first_candle_time is None:
+                        # No candles at all - skip this token
+                        skipped_symbols.append((symbol, "no candles"))
+                        continue
+
+                    # Make sure first_candle_time is timezone-aware
+                    if first_candle_time.tzinfo is None:
+                        first_candle_time = first_candle_time.replace(tzinfo=pytz.UTC)
+
+                    # Check if token has at least 24h of history
+                    if first_candle_time > min_first_candle_time:
+                        hours_available = (now - first_candle_time).total_seconds() / 3600
+                        skipped_symbols.append((symbol, f"{hours_available:.1f}h history"))
+                        continue
+
+                    filtered_symbols.append(symbol)
+
+                except Exception as e:
+                    logger.warning("Error checking history for %s: %s", symbol, e)
+                    # Include token on error to avoid accidentally excluding valid tokens
+                    filtered_symbols.append(symbol)
+
+        if skipped_symbols:
+            logger.info(
+                "Skipped %d new tokens (< %dh history): %s",
+                len(skipped_symbols),
+                min_history_hours,
+                ", ".join(f"{s}({r})" for s, r in skipped_symbols[:10])
+            )
+            if len(skipped_symbols) > 10:
+                logger.info("... and %d more", len(skipped_symbols) - 10)
+
+        logger.info(
+            "Token filter: %d -> %d symbols (skipped %d new tokens)",
+            len(symbols), len(filtered_symbols), len(skipped_symbols)
+        )
+
+        return filtered_symbols
 
 
     async def _seed_historical_candles(self, symbols: List[str]) -> None:
