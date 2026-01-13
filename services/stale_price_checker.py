@@ -68,10 +68,11 @@ class StalePriceChecker:
         self._stop_event.clear()
         self._task = asyncio.create_task(self._run_loop(), name="stale-price-checker")
         self._log.info(
-            "Stale price checker started (interval: %d min, lookback: %d min, consecutive: %d)",
-            self._interval_minutes,
-            self._lookback_minutes,
-            self._consecutive_stale,
+            "Stale price checker started (interval: {} min, lookback: {} min, consecutive: {})".format(
+                self._interval_minutes,
+                self._lookback_minutes,
+                self._consecutive_stale,
+            )
         )
 
     async def stop(self) -> None:
@@ -90,15 +91,13 @@ class StalePriceChecker:
 
     async def _run_loop(self) -> None:
         """Main loop - check every N minutes."""
-        # Initial delay to let other services start
-        await asyncio.sleep(60)
+        # Run first check immediately on startup
+        try:
+            await self.check_and_update()
+        except Exception as e:
+            self._log.error("Error in initial stale price check: {}", e)
 
         while not self._stop_event.is_set():
-            try:
-                await self.check_and_update()
-            except Exception as e:
-                self._log.error("Error in stale price check: %s", e)
-
             # Wait for next check
             try:
                 await asyncio.wait_for(
@@ -108,6 +107,11 @@ class StalePriceChecker:
                 break  # Stop event was set
             except asyncio.TimeoutError:
                 pass  # Time for next check
+
+            try:
+                await self.check_and_update()
+            except Exception as e:
+                self._log.error("Error in stale price check: {}", e)
 
     async def check_and_update(self) -> dict:
         """
@@ -154,7 +158,7 @@ class StalePriceChecker:
                         .values(is_active=False)
                     )
                     stats["disabled"] += 1
-                    self._log.info("Disabled token %s: stale price", token.symbol)
+                    self._log.info("Disabled token {}: stale price".format(token.symbol))
 
                 elif not is_stale and not token.is_active:
                     # Re-enable token that is no longer stale
@@ -164,14 +168,15 @@ class StalePriceChecker:
                         .values(is_active=True)
                     )
                     stats["enabled"] += 1
-                    self._log.info("Re-enabled token %s: price active again", token.symbol)
+                    self._log.info("Re-enabled token {}: price active again".format(token.symbol))
 
             await session.commit()
 
         duration = (datetime.now() - start_time).total_seconds()
         self._log.info(
-            "Stale price check completed in %.1fs: checked=%d, disabled=%d, enabled=%d",
-            duration, stats["checked"], stats["disabled"], stats["enabled"]
+            "Stale price check completed in {:.1f}s: checked={}, disabled={}, enabled={}".format(
+                duration, stats["checked"], stats["disabled"], stats["enabled"]
+            )
         )
 
         return stats
