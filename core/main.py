@@ -52,7 +52,7 @@ from services.real_order_executor import (
     create_place_order_function,
     create_get_balance_function,
 )
-from sqlalchemy import func, select, update
+
 
 class TradingBot:
     """
@@ -313,31 +313,6 @@ class TradingBot:
         assert self._repository is not None
         assert self._db is not None
 
-        # Check existing tokens with is_active=True
-        # tokens = await self._repository.get_all(
-        #     Token,
-        #     filters={"is_active": True},
-        #     limit=settings.max_symbols if settings.max_symbols > 0 else None
-        # )
-
-        # if tokens:
-        #     logger.info("Loaded %d active tokens from database", len(tokens))
-        #     # Filter by current category
-        #     category = settings.bybit_category.lower()
-        #     symbols = [
-        #         t.bybit_symbol for t in tokens
-        #         if t.bybit_categories and category in t.bybit_categories.lower()
-        #     ]
-        #     logger.info("Filtered to %d symbols for category '%s'", len(symbols), category)
-
-        #     # Filter out tokens that appeared less than 24h ago
-        #     symbols = await self._filter_new_tokens(symbols)
-
-        #     return symbols
-
-        # # No tokens - run initial sync
-        # logger.info("No tokens in database, running initial sync...")
-
         self._token_sync_service = TokenSyncService(
             repository=self._repository,
             market_cap_threshold_usd=settings.min_market_cap_usd,
@@ -373,9 +348,8 @@ class TradingBot:
         """
         Filter out tokens that appeared on the exchange less than 24 hours ago.
 
-        Checks the earliest candle timestamp for each symbol.
-        Tokens with less than 24h of history are skipped until next sync.
-        Updates deactivation_reason in DB for filtered tokens.
+        Requests candle history directly from Bybit API to check if token has
+        trading history older than 24 hours.
 
         Args:
             symbols: List of symbols to filter
@@ -390,47 +364,55 @@ class TradingBot:
 
         min_history_hours = 24
         now = datetime.now(pytz.UTC)
-        min_first_candle_time = now - timedelta(hours=min_history_hours)
+        check_time_ms = int((now - timedelta(hours=min_history_hours)).timestamp() * 1000)
 
         filtered_symbols = []
         skipped_symbols = []
 
-        async with self._db.session_factory() as session:
+        # Check each symbol via Bybit API
+        async with BybitClient(logger=logger) as bybit:
+            sem = asyncio.Semaphore(10)  # Limit concurrent requests
 
-            for symbol in symbols:
-                try:
-                    # Get the earliest candle timestamp for this symbol
-                    stmt = select(func.min(Candle1m.timestamp)).where(
-                        Candle1m.symbol == symbol
-                    )
-                    result = await session.execute(stmt)
-                    first_candle_time = result.scalar()
+            async def check_symbol(symbol: str) -> tuple:
+                """Check if symbol has history older than 24h."""
+                async with sem:
+                    try:
+                        # Request candles from 24h+ ago (just 1-2 to check existence)
+                        raw = await bybit.get_kline_page(
+                            category=settings.bybit_category,
+                            symbol=symbol,
+                            interval="1",
+                            start_ms=check_time_ms - 60000,  # 1 min before check time
+                            end_ms=check_time_ms,
+                            limit=2,
+                        )
 
-                    if first_candle_time is None:
-                        # No candles at all - skip this token
-                        skipped_symbols.append((symbol, "no candles"))
-                        continue
+                        if raw:
+                            # Has history older than 24h - token is not new
+                            return (symbol, True, None)
+                        else:
+                            # No history from 24h+ ago - token is new
+                            return (symbol, False, "< 24h history")
 
-                    # Make sure first_candle_time is timezone-aware
-                    if first_candle_time.tzinfo is None:
-                        first_candle_time = first_candle_time.replace(tzinfo=pytz.UTC)
+                    except Exception as e:
+                        logger.warning("Error checking history for %s: %s", symbol, e)
+                        # Include token on error to avoid accidentally excluding valid tokens
+                        return (symbol, True, None)
 
-                    # Check if token has at least 24h of history
-                    if first_candle_time > min_first_candle_time:
-                        hours_available = (now - first_candle_time).total_seconds() / 3600
-                        skipped_symbols.append((symbol, f"{hours_available:.1f}h history"))
-                        continue
+            # Check all symbols concurrently
+            tasks = [check_symbol(s) for s in symbols]
+            results = await asyncio.gather(*tasks)
 
+            for symbol, has_history, reason in results:
+                if has_history:
                     filtered_symbols.append(symbol)
+                else:
+                    skipped_symbols.append((symbol, reason))
 
-                except Exception as e:
-                    logger.warning("Error checking history for %s: %s", symbol, e)
-                    # Include token on error to avoid accidentally excluding valid tokens
-                    filtered_symbols.append(symbol)
-
-            # Update deactivation_reason in all_tokens and remove from tokens
-            if skipped_symbols:
-                from sqlalchemy import delete as sql_delete
+        # Update deactivation_reason in all_tokens for skipped tokens
+        if skipped_symbols:
+            async with self._db.session_factory() as session:
+                from sqlalchemy import update
 
                 for bybit_symbol, _ in skipped_symbols:
                     try:
@@ -442,11 +424,15 @@ class TradingBot:
                         )
                         await session.execute(stmt)
 
-                        # Remove from tradable tokens table
-                        del_stmt = sql_delete(Token).where(Token.bybit_symbol == bybit_symbol)
-                        await session.execute(del_stmt)
+                        # Set is_active=False in tokens table (don't delete)
+                        stmt = (
+                            update(Token)
+                            .where(Token.bybit_symbol == bybit_symbol)
+                            .values(is_active=False)
+                        )
+                        await session.execute(stmt)
                     except Exception as e:
-                        logger.debug("Failed to update/remove new token %s: %s", bybit_symbol, e)
+                        logger.debug("Failed to update new token %s: %s", bybit_symbol, e)
 
                 await session.commit()
 
@@ -455,7 +441,7 @@ class TradingBot:
                 "Skipped %d new tokens (< %dh history): %s",
                 len(skipped_symbols),
                 min_history_hours,
-                ", ".join(f"{s}({r})" for s, r in skipped_symbols[:10])
+                ", ".join(f"{s}" for s, _ in skipped_symbols[:10])
             )
             if len(skipped_symbols) > 10:
                 logger.info("... and %d more", len(skipped_symbols) - 10)
