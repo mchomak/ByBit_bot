@@ -12,7 +12,7 @@ import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from services.bybit_client import BybitClient
 from db.repository import Repository
-from db.models import Token, BlacklistedToken
+from db.models import Token, AllToken, BlacklistedToken
 
 
 @dataclass(frozen=True)
@@ -150,21 +150,21 @@ async def sync_tokens_to_database(
     symbol_aliases: Optional[Dict[str, str]] = None,
     logger: Optional[logging.Logger] = None,
     filter_st_tokens: bool = True,
-    filter_stale_prices: bool = True,
-    stale_lookback_minutes: int = 50,
-    stale_consecutive_candles: int = 3,
 ) -> int:
     """
-    Синхронизирует токены в БД:
-    1) Получает данные из CoinPaprika (/v1/tickers)
-    2) Фильтрует по порогу market cap
-    3) Получает инструменты Bybit и строит universe baseCoin для категорий
-    4) Делает пересечение по symbol==baseCoin
-    5) Исключает токены из чёрного списка
-    6) Исключает ST (Special Treatment / высокорисковые) токены
-    7) Исключает токены с неактивной ценой (stale prices)
-    8) Сохраняет токены в БД через очередь (upsert по symbol)
-    9) Деактивирует токены, которых больше нет в списке или отфильтрованы
+    Синхронизирует токены в БД (daily sync).
+
+    Applies 4 main filters (NOT StalePrice - that's separate):
+    1) Market cap threshold
+    2) Blacklist
+    3) ST (Special Treatment / high-risk)
+    4) Available on Bybit
+
+    Two-table structure:
+    - all_tokens: stores ALL tokens with deactivation_reason
+    - tokens: stores only tradable tokens (passed all 4 filters)
+
+    StalePrice is NOT checked here - it runs separately every 50 minutes.
 
     Args:
         repository: Repository instance для работы с БД
@@ -173,12 +173,9 @@ async def sync_tokens_to_database(
         symbol_aliases: Словарь алиасов для нормализации символов
         logger: Logger instance
         filter_st_tokens: Исключать ST (Special Treatment) токены
-        filter_stale_prices: Исключать токены с неактивной ценой
-        stale_lookback_minutes: Сколько минут истории проверять для stale
-        stale_consecutive_candles: Сколько подряд свечей open==close для фильтрации
 
     Returns:
-        Количество синхронизированных токенов
+        Количество активных (tradable) токенов
     """
     log = logger or logging.getLogger("TokenSync")
     aliases = symbol_aliases or {}
@@ -213,103 +210,104 @@ async def sync_tokens_to_database(
             if st_tokens:
                 log.info("Found %d ST tokens to exclude: %s", len(st_tokens), sorted(st_tokens)[:20])
 
-        synced_symbols: Set[str] = set()
-        tokens_to_sync = []
-
-        # Track filtered tokens with reasons for deactivation
-        filtered_tokens: Dict[str, str] = {}  # symbol -> reason
+        # Collect ALL tokens for all_tokens table
+        all_tokens_data: List[Dict[str, Any]] = []
+        # Collect only active tokens for tokens table
+        active_tokens_data: List[Dict[str, Any]] = []
 
         blacklisted_count = 0
         st_filtered_count = 0
+
         for t in candidates:
             normalized_symbol = _apply_symbol_aliases(t.symbol, aliases)
             bybit_cats: Set[str] = base_map.get(normalized_symbol, set())
 
             if not bybit_cats:
-                continue
+                continue  # Not on Bybit - skip entirely
 
-            # Skip blacklisted tokens
-            if normalized_symbol.upper() in blacklisted_symbols:
-                blacklisted_count += 1
-                filtered_tokens[normalized_symbol] = "Blacklist"
-                log.debug(f"Skipping blacklisted token: {normalized_symbol}")
-                continue
-
-            # Skip ST (Special Treatment) tokens
-            if normalized_symbol.upper() in st_tokens:
-                st_filtered_count += 1
-                filtered_tokens[normalized_symbol] = "ST"
-                log.debug(f"Skipping ST token: {normalized_symbol}")
-                continue
-
-            # Формируем bybit_symbol (для spot обычно SYMBOL+USDT)
-            # Если в категориях есть "linear" - это фьючерсы, иначе spot
             bybit_symbol = f"{normalized_symbol}USDT"
-
-            # Store categories as comma-separated string for filtering
             categories_str = ",".join(sorted(bybit_cats))
 
-            tokens_to_sync.append({
+            token_data = {
                 "symbol": normalized_symbol,
                 "bybit_symbol": bybit_symbol,
                 "name": t.name,
                 "market_cap_usd": int(t.market_cap_usd),
                 "bybit_categories": categories_str,
-                "is_active": True,
+            }
+
+            # Determine deactivation reason (if any)
+            deactivation_reason = None
+
+            if normalized_symbol.upper() in blacklisted_symbols:
+                deactivation_reason = "Blacklist"
+                blacklisted_count += 1
+            elif normalized_symbol.upper() in st_tokens:
+                deactivation_reason = "ST"
+                st_filtered_count += 1
+
+            # Add to all_tokens with reason
+            all_tokens_data.append({
+                **token_data,
+                "is_active": deactivation_reason is None,
+                "deactivation_reason": deactivation_reason,
             })
 
-            synced_symbols.add(normalized_symbol)
+            # Add to active tokens only if no deactivation reason
+            if deactivation_reason is None:
+                active_tokens_data.append(token_data)
 
         if blacklisted_count > 0:
-            log.info(f"Skipped {blacklisted_count} blacklisted tokens")
+            log.info(f"Filtered {blacklisted_count} blacklisted tokens")
         if st_filtered_count > 0:
-            log.info(f"Skipped {st_filtered_count} ST (high-risk) tokens")
+            log.info(f"Filtered {st_filtered_count} ST (high-risk) tokens")
 
-        # Check for stale prices (inactive tokens) if enabled
-        stale_filtered_count = 0
-        if filter_stale_prices and tokens_to_sync:
-            log.info(
-                "Checking for stale prices (%d consecutive flat candles in last %d minutes)...",
-                stale_consecutive_candles, stale_lookback_minutes
+        # Sort by market cap
+        all_tokens_data.sort(key=lambda x: x["market_cap_usd"], reverse=True)
+        active_tokens_data.sort(key=lambda x: x["market_cap_usd"], reverse=True)
+
+        # Get current active symbols for deactivation check
+        active_symbols = {t["symbol"] for t in active_tokens_data}
+
+        # ============================================================
+        # 1. Update all_tokens table (full list with reasons)
+        # ============================================================
+        log.info(f"Updating all_tokens table: {len(all_tokens_data)} tokens...")
+        for token_data in all_tokens_data:
+            await repository.enqueue_upsert(
+                model=AllToken,
+                conflict_keys={"symbol": token_data["symbol"]},
+                update_values={
+                    "bybit_symbol": token_data["bybit_symbol"],
+                    "name": token_data["name"],
+                    "market_cap_usd": token_data["market_cap_usd"],
+                    "bybit_categories": token_data["bybit_categories"],
+                    "is_active": token_data["is_active"],
+                    "deactivation_reason": token_data["deactivation_reason"],
+                }
             )
-            # Get list of bybit_symbols to check
-            symbols_to_check = [t["bybit_symbol"] for t in tokens_to_sync]
 
-            # Check which category to use (prefer spot)
-            check_category = "spot" if "spot" in bybit_categories else bybit_categories[0]
-
-            stale_symbols = await bybit.check_stale_prices(
-                category=check_category,
-                symbols=symbols_to_check,
-                lookback_minutes=stale_lookback_minutes,
-                consecutive_stale=stale_consecutive_candles,
-            )
-
-            if stale_symbols:
-                # Filter out stale tokens
-                original_count = len(tokens_to_sync)
-                tokens_to_sync = [
-                    t for t in tokens_to_sync
-                    if t["bybit_symbol"] not in stale_symbols
-                ]
-                stale_filtered_count = original_count - len(tokens_to_sync)
-                log.info(
-                    f"Filtered out {stale_filtered_count} tokens with stale prices: "
-                    f"{sorted(list(stale_symbols)[:10])}{'...' if len(stale_symbols) > 10 else ''}"
+        # Deactivate tokens no longer in the list (low mcap)
+        existing_all_tokens = await repository.get_all(model=AllToken)
+        current_symbols = {t["symbol"] for t in all_tokens_data}
+        for token in existing_all_tokens:
+            if token.symbol not in current_symbols:
+                await repository.enqueue_update(
+                    model=AllToken,
+                    filter_by={"symbol": token.symbol},
+                    update_values={
+                        "is_active": False,
+                        "deactivation_reason": "LowMcap",
+                    }
                 )
 
-                # Also remove from synced_symbols and track reason
-                for symbol in list(synced_symbols):
-                    if f"{symbol}USDT" in stale_symbols:
-                        synced_symbols.discard(symbol)
-                        filtered_tokens[symbol] = "StalePrice"
+        # ============================================================
+        # 2. Update tokens table (only active/tradable tokens)
+        # ============================================================
+        log.info(f"Updating tokens table: {len(active_tokens_data)} active tokens...")
 
-        # Сортируем по market cap (от большего к меньшему)
-        tokens_to_sync.sort(key=lambda x: x["market_cap_usd"], reverse=True)
-
-        # Отправляем токены в очередь на запись (upsert)
-        log.info(f"Enqueueing {len(tokens_to_sync)} tokens for upsert...")
-        for token_data in tokens_to_sync:
+        # Upsert active tokens
+        for token_data in active_tokens_data:
             await repository.enqueue_upsert(
                 model=Token,
                 conflict_keys={"symbol": token_data["symbol"]},
@@ -318,68 +316,35 @@ async def sync_tokens_to_database(
                     "name": token_data["name"],
                     "market_cap_usd": token_data["market_cap_usd"],
                     "bybit_categories": token_data["bybit_categories"],
-                    "is_active": True,
-                    "deactivation_reason": None,  # Clear reason when activating
                 }
             )
 
-        # Получаем все активные токены из БД
-        log.info("Fetching active tokens from database...")
-        active_tokens = await repository.get_all(
-            model=Token,
-            filters={"is_active": True}
-        )
-
-        # Деактивируем токены, которых больше нет в списке ИЛИ в чёрном списке
-        tokens_to_deactivate = 0
-        blacklisted_deactivated = 0
-        for token in active_tokens:
-            should_deactivate = False
-            deactivation_reason = None
-
-            # Check if filtered with a specific reason
-            if token.symbol in filtered_tokens:
-                should_deactivate = True
-                deactivation_reason = filtered_tokens[token.symbol]
-                if deactivation_reason == "Blacklist":
-                    blacklisted_deactivated += 1
-            # Check if in blacklist (double-check by uppercase)
-            elif token.symbol.upper() in blacklisted_symbols:
-                should_deactivate = True
-                deactivation_reason = "Blacklist"
-                blacklisted_deactivated += 1
-            # Check if no longer in sync list (low mcap or not on Bybit)
-            elif token.symbol not in synced_symbols:
-                should_deactivate = True
-                deactivation_reason = "LowMcap"  # Most likely reason
-
-            if should_deactivate:
-                await repository.enqueue_update(
+        # Remove tokens that are no longer active from tokens table
+        existing_tokens = await repository.get_all(model=Token)
+        tokens_removed = 0
+        for token in existing_tokens:
+            if token.symbol not in active_symbols:
+                await repository.enqueue_delete(
                     model=Token,
-                    filter_by={"symbol": token.symbol},
-                    update_values={
-                        "is_active": False,
-                        "deactivation_reason": deactivation_reason,
-                    }
+                    filter_by={"symbol": token.symbol}
                 )
-                tokens_to_deactivate += 1
-                log.debug(f"Deactivating token {token.symbol}: {deactivation_reason}")
+                tokens_removed += 1
 
-        if tokens_to_deactivate > 0:
-            log.info(
-                f"Deactivating {tokens_to_deactivate} tokens "
-                f"({blacklisted_deactivated} blacklisted, "
-                f"{tokens_to_deactivate - blacklisted_deactivated} no longer tradable)"
-            )
+        if tokens_removed > 0:
+            log.info(f"Removed {tokens_removed} tokens from tradable list")
 
         # Ждем завершения всех операций в очереди
         log.info("Waiting for write queue to complete...")
         await repository._write_queue.join()
 
-        log.info(f"Token sync completed: {len(tokens_to_sync)} tokens synced, "
-                f"{tokens_to_deactivate} deactivated")
-        
-        return len(tokens_to_sync)
+        log.info(
+            f"Token sync completed: {len(all_tokens_data)} total, "
+            f"{len(active_tokens_data)} tradable, "
+            f"{blacklisted_count} blacklisted, "
+            f"{st_filtered_count} ST filtered"
+        )
+
+        return len(active_tokens_data)
 
 
 async def collect_tokens_tradable_on_bybit_with_mcap(

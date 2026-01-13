@@ -88,10 +88,10 @@ class LogLevel(str, Enum):
 
 class Token(Base):
     """
-    List of coins/pairs that the bot monitors.
+    List of tradable tokens that passed all filters.
 
-    Populated by MarketUniverseService from CoinMarketCap + Bybit API.
-    Filtered by market_cap > MIN_MARKET_CAP_USD.
+    Only contains tokens that are ready for trading.
+    Populated from AllToken after filtering.
     """
 
     __tablename__ = "tokens"
@@ -102,12 +102,39 @@ class Token(Base):
     name = Column(String(100), nullable=True)  # e.g., "Bitcoin"
     market_cap_usd = Column(BigInteger, nullable=True)
     bybit_categories = Column(String(50), nullable=True)  # Comma-separated: "spot,linear"
-    is_active = Column(Boolean, default=True)  # Whether to trade this token
-    deactivation_reason = Column(String(50), nullable=True)  # Reason for deactivation (Blacklist, New, ST, StalePrice, LowMcap, etc.)
     max_market_qty = Column(Float, nullable=True)  # Max quantity for market orders (learned from errors)
     last_updated = Column(DateTime(timezone=True), server_default=func.now())
 
-    __table_args__ = (Index("ix_tokens_active", "is_active"),)
+
+class AllToken(Base):
+    """
+    Complete list of all tokens (tradable and non-tradable).
+
+    Stores all tokens with their deactivation reasons.
+    Used as source for the tokens table after filtering.
+
+    Deactivation reasons:
+    - Blacklist: Token in manual blacklist
+    - ST: Special Treatment / high-risk token
+    - LowMcap: Low market cap or not available on Bybit
+    - New: Token appeared on exchange < 24h ago
+    - StalePrice: Inactive price (checked every 50 min)
+    """
+
+    __tablename__ = "all_tokens"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    symbol = Column(String(20), nullable=False, unique=True, index=True)  # e.g., "BTC"
+    bybit_symbol = Column(String(30), nullable=False, unique=True)  # e.g., "BTCUSDT"
+    name = Column(String(100), nullable=True)  # e.g., "Bitcoin"
+    market_cap_usd = Column(BigInteger, nullable=True)
+    bybit_categories = Column(String(50), nullable=True)  # Comma-separated: "spot,linear"
+    is_active = Column(Boolean, default=True)  # Whether token passed main 4 filters
+    deactivation_reason = Column(String(50), nullable=True)  # Reason for deactivation
+    max_market_qty = Column(Float, nullable=True)  # Max quantity for market orders
+    last_updated = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (Index("ix_all_tokens_active", "is_active"),)
 
 
 class BlacklistedToken(Base):
