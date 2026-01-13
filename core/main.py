@@ -39,19 +39,20 @@ from core.bootstrap_logging import setup_logging
 from core.create_daily_report import DailyReportService
 from bot.TelegramBot import TelegramBot
 from db.database import Database, CandleWriterService
-from db.models import Candle1m, Position, Order, Signal, Token, User
+from db.models import Candle1m, Position, Order, Signal, Token, AllToken, User
 from db.repository import Repository
 from services.bybit_client import BybitClient
 from services.pipeline_events import PipelineMetrics, CandleUpdate, TradingSignal, SignalType
 from services.strategy_engine import StrategyEngine
 from services.execution_engine import ExecutionEngine
 from services.token_sync_service import TokenSyncService
+from services.stale_price_checker import StalePriceChecker
 from services.real_order_executor import (
     RealOrderExecutorService,
     create_place_order_function,
     create_get_balance_function,
 )
-
+from sqlalchemy import func, select, update
 
 class TradingBot:
     """
@@ -89,6 +90,7 @@ class TradingBot:
         self._execution_engine: Optional[ExecutionEngine] = None
         self._order_executor: Optional[RealOrderExecutorService] = None
         self._token_sync_service: Optional[TokenSyncService] = None
+        self._stale_price_checker: Optional[StalePriceChecker] = None
         self._telegram_bot: Optional[TelegramBot] = None
         self._daily_report_service: Optional[DailyReportService] = None
 
@@ -152,6 +154,9 @@ class TradingBot:
             # 10. Start daily report scheduler
             await self._start_daily_report_scheduler()
 
+            # 11. Start stale price checker (every 50 min)
+            await self._start_stale_price_checker()
+
             # Notify successful start
             await self._notify(
                 f"Торговый бот запущен\n"
@@ -207,6 +212,9 @@ class TradingBot:
 
         if self._token_sync_service:
             await self._token_sync_service.stop()
+
+        if self._stale_price_checker:
+            await self._stale_price_checker.stop()
 
         if self._daily_report_service:
             await self._daily_report_service.stop()
@@ -300,11 +308,12 @@ class TradingBot:
         Initialize token list.
 
         Either loads existing tokens from DB or runs initial sync.
+        Filters by is_active=True (StalePrice checker controls this).
         """
         assert self._repository is not None
         assert self._db is not None
 
-        # Check existing tokens
+        # Check existing tokens with is_active=True
         # tokens = await self._repository.get_all(
         #     Token,
         #     filters={"is_active": True},
@@ -336,20 +345,16 @@ class TradingBot:
             symbol_aliases=settings.symbol_aliases_dict,
             sync_interval_hours=24,  # Will be managed by scheduler
             filter_st_tokens=settings.filter_st_tokens,
-            filter_stale_prices=settings.filter_stale_prices,
-            stale_lookback_minutes=settings.stale_lookback_minutes,
-            stale_consecutive_candles=settings.stale_consecutive_candles,
         )
 
         count = await self._token_sync_service.sync_now()
-        logger.info("Initial token sync completed: %d tokens", count)
+        logger.info("Initial token sync completed: %d tradable tokens", count)
 
         await self._notify(f"Синхронизация токенов: загружено {count} токенов", notify_type="sync")
 
         # Reload tokens
         tokens = await self._repository.get_all(
             Token,
-            filters={"is_active": True},
             limit=settings.max_symbols if settings.max_symbols > 0 else None
         )
 
@@ -370,6 +375,7 @@ class TradingBot:
 
         Checks the earliest candle timestamp for each symbol.
         Tokens with less than 24h of history are skipped until next sync.
+        Updates deactivation_reason in DB for filtered tokens.
 
         Args:
             symbols: List of symbols to filter
@@ -390,7 +396,6 @@ class TradingBot:
         skipped_symbols = []
 
         async with self._db.session_factory() as session:
-            from sqlalchemy import func, select
 
             for symbol in symbols:
                 try:
@@ -422,6 +427,28 @@ class TradingBot:
                     logger.warning("Error checking history for %s: %s", symbol, e)
                     # Include token on error to avoid accidentally excluding valid tokens
                     filtered_symbols.append(symbol)
+
+            # Update deactivation_reason in all_tokens and remove from tokens
+            if skipped_symbols:
+                from sqlalchemy import delete as sql_delete
+
+                for bybit_symbol, _ in skipped_symbols:
+                    try:
+                        # Update all_tokens with reason
+                        stmt = (
+                            update(AllToken)
+                            .where(AllToken.bybit_symbol == bybit_symbol)
+                            .values(deactivation_reason="New", is_active=False)
+                        )
+                        await session.execute(stmt)
+
+                        # Remove from tradable tokens table
+                        del_stmt = sql_delete(Token).where(Token.bybit_symbol == bybit_symbol)
+                        await session.execute(del_stmt)
+                    except Exception as e:
+                        logger.debug("Failed to update/remove new token %s: %s", bybit_symbol, e)
+
+                await session.commit()
 
         if skipped_symbols:
             logger.info(
@@ -845,6 +872,18 @@ class TradingBot:
         )
         await self._daily_report_service.start()
         logger.info("Daily report scheduler started (runs at 00:00 UTC)")
+
+    async def _start_stale_price_checker(self) -> None:
+        """Start stale price checker service (runs every 50 minutes)."""
+        self._stale_price_checker = StalePriceChecker(
+            session_factory=self._db.session_factory,
+            bybit_category=settings.bybit_category,
+            check_interval_minutes=50,
+            lookback_minutes=50,
+            consecutive_stale_candles=3,
+        )
+        await self._stale_price_checker.start()
+        logger.info("Stale price checker started (runs every 50 minutes)")
 
     # =========================================================================
     # Notification Helper
