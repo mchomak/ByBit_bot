@@ -92,6 +92,8 @@ class Token(Base):
 
     Only contains tokens that are ready for trading.
     Populated from AllToken after filtering.
+
+    is_active: controlled by StalePrice checker only (every 50 min)
     """
 
     __tablename__ = "tokens"
@@ -102,8 +104,11 @@ class Token(Base):
     name = Column(String(100), nullable=True)  # e.g., "Bitcoin"
     market_cap_usd = Column(BigInteger, nullable=True)
     bybit_categories = Column(String(50), nullable=True)  # Comma-separated: "spot,linear"
+    is_active = Column(Boolean, default=True)  # StalePrice checker sets this
     max_market_qty = Column(Float, nullable=True)  # Max quantity for market orders (learned from errors)
     last_updated = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (Index("ix_tokens_active", "is_active"),)
 
 
 class AllToken(Base):

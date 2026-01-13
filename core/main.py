@@ -308,19 +308,20 @@ class TradingBot:
         Initialize token list.
 
         Either loads existing tokens from DB or runs initial sync.
-        Tokens table now only contains tradable tokens (no is_active filter needed).
+        Filters by is_active=True (StalePrice checker controls this).
         """
         assert self._repository is not None
         assert self._db is not None
 
-        # Check existing tokens (tokens table = only tradable tokens)
+        # Check existing tokens with is_active=True
         tokens = await self._repository.get_all(
             Token,
+            filters={"is_active": True},
             limit=settings.max_symbols if settings.max_symbols > 0 else None
         )
 
         if tokens:
-            logger.info("Loaded %d tradable tokens from database", len(tokens))
+            logger.info("Loaded %d active tokens from database", len(tokens))
             # Filter by current category
             category = settings.bybit_category.lower()
             symbols = [

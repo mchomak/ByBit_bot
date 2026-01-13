@@ -306,7 +306,7 @@ async def sync_tokens_to_database(
         # ============================================================
         log.info(f"Updating tokens table: {len(active_tokens_data)} active tokens...")
 
-        # Upsert active tokens
+        # Upsert active tokens (reset is_active to True during daily sync)
         for token_data in active_tokens_data:
             await repository.enqueue_upsert(
                 model=Token,
@@ -316,6 +316,7 @@ async def sync_tokens_to_database(
                     "name": token_data["name"],
                     "market_cap_usd": token_data["market_cap_usd"],
                     "bybit_categories": token_data["bybit_categories"],
+                    "is_active": True,  # Reset for StalePrice checker
                 }
             )
 
