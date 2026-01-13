@@ -168,7 +168,7 @@ class TradingBot:
             )
 
             logger.info("=" * 60)
-            logger.info("BOT RUNNING - Monitoring %d symbols", len(symbols))
+            logger.info("BOT RUNNING - Monitoring {} symbols", len(symbols))
             logger.info("=" * 60)
 
             # Wait for shutdown signal
@@ -287,12 +287,12 @@ class TradingBot:
         )
 
         logger.info(
-            "Bybit client initialized (category=%s, demo=%s)",
+            "Bybit client initialized (category={}, demo={})",
             settings.bybit_category,
             settings.bybit_demo
         )
         logger.info(
-            "Market data: REST=%s, WS=%s",
+            "Market data: REST={}, WS={}",
             settings.bybit_rest_base_url,
             settings.bybit_ws_domain
         )
@@ -323,7 +323,7 @@ class TradingBot:
         )
 
         count = await self._token_sync_service.sync_now()
-        logger.info("Initial token sync completed: %d tradable tokens", count)
+        logger.info("Initial token sync completed: {} tradable tokens", count)
 
         await self._notify(f"Синхронизация токенов: загружено {count} токенов", notify_type="sync")
 
@@ -395,7 +395,7 @@ class TradingBot:
                             return (symbol, False, "< 24h history")
 
                     except Exception as e:
-                        logger.warning("Error checking history for %s: %s", symbol, e)
+                        logger.warning("Error checking history for {}: {}", symbol, e)
                         # Include token on error to avoid accidentally excluding valid tokens
                         return (symbol, True, None)
 
@@ -432,22 +432,22 @@ class TradingBot:
                         )
                         await session.execute(stmt)
                     except Exception as e:
-                        logger.debug("Failed to update new token %s: %s", bybit_symbol, e)
+                        logger.debug("Failed to update new token {}: {}", bybit_symbol, e)
 
                 await session.commit()
 
         if skipped_symbols:
             logger.info(
-                "Skipped %d new tokens (< %dh history): %s",
+                "Skipped {} new tokens (< {}h history): {}",
                 len(skipped_symbols),
                 min_history_hours,
                 ", ".join(f"{s}" for s, _ in skipped_symbols[:10])
             )
             if len(skipped_symbols) > 10:
-                logger.info("... and %d more", len(skipped_symbols) - 10)
+                logger.info("... and {} more", len(skipped_symbols) - 10)
 
         logger.info(
-            "Token filter: %d -> %d symbols (skipped %d new tokens)",
+            "Token filter: {} -> {} symbols (skipped {} new tokens)",
             len(symbols), len(filtered_symbols), len(skipped_symbols)
         )
 
@@ -464,7 +464,7 @@ class TradingBot:
         assert self._bybit_client is not None
         assert self._db is not None
 
-        logger.info("Checking candle history for %d symbols...", len(symbols))
+        logger.info("Checking candle history for {} symbols...", len(symbols))
 
         # Check which symbols need backfill
         symbols_to_backfill = []
@@ -486,19 +486,19 @@ class TradingBot:
                     if count < required_candles * 0.9:  # Allow 10% tolerance
                         symbols_to_backfill.append(symbol)
                         logger.debug(
-                            "Symbol %s needs backfill: %d/%d candles",
+                            "Symbol {} needs backfill: {}/{} candles",
                             symbol, count, required_candles
                         )
                 except Exception as e:
-                    logger.warning("Error checking candles for %s: %s", symbol, e)
+                    logger.warning("Error checking candles for {}: {}", symbol, e)
                     symbols_to_backfill.append(symbol)
 
         if not symbols_to_backfill:
-            logger.info("All %d symbols have sufficient candle history", len(symbols))
+            logger.info("All {} symbols have sufficient candle history", len(symbols))
             return
 
         logger.info(
-            "Backfilling %d/%d symbols with insufficient history (%d days)...",
+            "Backfilling {}/{} symbols with insufficient history ({} days)...",
             len(symbols_to_backfill),
             len(symbols),
             settings.seed_days
@@ -513,7 +513,7 @@ class TradingBot:
                 days=settings.seed_days,
                 concurrency=settings.seed_concurrency,
             )
-            logger.info("Historical candle backfill complete for %d symbols", len(symbols_to_backfill))
+            logger.info("Historical candle backfill complete for {} symbols", len(symbols_to_backfill))
         except Exception as e:
             logger.error("Error seeding historical candles: {}", e)
             # Continue anyway - strategy will work with available data
@@ -552,7 +552,7 @@ class TradingBot:
         )
 
         # Load historical data for strategy state (ALL symbols)
-        logger.info("Loading candle history for %d symbols into strategy engine...", len(symbols))
+        logger.info("Loading candle history for {} symbols into strategy engine...", len(symbols))
         loaded_count = 0
         for i, symbol in enumerate(symbols):
             try:
@@ -561,12 +561,12 @@ class TradingBot:
                     self._strategy_engine.load_historical_data(symbol, candles)
                     loaded_count += 1
                     if (i + 1) % 50 == 0:
-                        logger.info("Loaded history for %d/%d symbols...", i + 1, len(symbols))
+                        logger.info("Loaded history for {}/{} symbols...", i + 1, len(symbols))
             except Exception as e:
                 logger.debug("Failed to load history for {}: {}", symbol, e)
 
         logger.info(
-            "Strategy state initialized: %d/%d symbols with history (max_vol, MA14)",
+            "Strategy state initialized: {}/{} symbols with history (max_vol, MA14)",
             loaded_count, len(symbols)
         )
 
@@ -579,8 +579,8 @@ class TradingBot:
         # Check if API keys are configured for the current mode
         if not settings.active_api_key or not settings.active_api_secret:
             logger.error(
-                "API keys not configured for %s mode! "
-                "Please set %s in .env",
+                "API keys not configured for {} mode! "
+                "Please set {} in .env",
                 settings.trading_mode,
                 "BYBIT_DEMO_API_KEY/SECRET" if settings.bybit_demo else "BYBIT_API_KEY/SECRET"
             )
@@ -590,7 +590,7 @@ class TradingBot:
                 notify_type="error"
             )
         else:
-            logger.info("Initializing order executor (%s mode)...", settings.trading_mode)
+            logger.info("Initializing order executor ({} mode)...", settings.trading_mode)
             self._order_executor = RealOrderExecutorService(
                 api_key=settings.active_api_key,
                 api_secret=settings.active_api_secret,
@@ -742,7 +742,7 @@ class TradingBot:
             name="ws-kline-stream"
         )
 
-        logger.info("WebSocket stream started for %d symbols", len(symbols))
+        logger.info("WebSocket stream started for {} symbols", len(symbols))
 
 
     async def _start_token_sync_scheduler(self) -> None:
@@ -752,7 +752,7 @@ class TradingBot:
             name="token-sync-scheduler"
         )
         logger.info(
-            "Token sync scheduler started (daily at %s %s)",
+            "Token sync scheduler started (daily at {} {})",
             settings.token_sync_time,
             settings.timezone
         )
@@ -797,12 +797,12 @@ class TradingBot:
                 if self._execution_engine:
                     cleared = self._execution_engine.clear_disabled_tokens()
                     if cleared > 0:
-                        logger.info("Cleared %d disabled tokens during sync", cleared)
+                        logger.info("Cleared {} disabled tokens during sync", cleared)
 
                 if self._token_sync_service and self._repository:
                     try:
                         count = await self._token_sync_service.sync_now()
-                        logger.info("Scheduled token sync completed: %d tokens", count)
+                        logger.info("Scheduled token sync completed: {} tokens", count)
                         await self._notify(f"Синхронизация токенов: синхронизировано {count} токенов", notify_type="sync")
                     except Exception as e:
                         logger.error("Token sync failed: {}", e)
@@ -898,7 +898,7 @@ class TradingBot:
 def signal_handler(bot: TradingBot) -> None:
     """Create signal handler for graceful shutdown."""
     def handler(sig, frame):
-        logger.info("Received signal %s, initiating shutdown...", sig)
+        logger.info("Received signal {}, initiating shutdown...", sig)
         asyncio.get_event_loop().call_soon_threadsafe(bot._stop_event.set)
     return handler
 
@@ -910,7 +910,7 @@ async def main() -> None:
     setup_logging(settings.log_dir, telegram_queue=telegram_queue)
 
     logger.info("Starting Bybit Trading Bot...")
-    logger.info("Config: category=%s, mode=%s",
+    logger.info("Config: category={}, mode={}",
                 settings.bybit_category, settings.trading_mode)
 
     # Create bot instance
