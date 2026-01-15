@@ -228,9 +228,15 @@ class BybitClient:
                 continue
 
             # Check for ST (Special Treatment) tokens
-            # 1. Bybit may return "innovation" or "riskTag" field for ST tokens
-            # 2. Some ST tokens have "ST" in their symbol name
+            # 1. Bybit returns stTag field: "0" = normal, "1" = high-risk
+            # 2. innovation field: "1" = innovation zone (higher risk)
+            # 3. Some ST tokens have "ST" in their symbol name
             is_st = False
+
+            # Check stTag field - primary indicator for ST tokens
+            st_tag = str(it.get("stTag", "0"))
+            if st_tag == "1":
+                is_st = True
 
             # Check innovation field (for spot) - "1" means innovation zone (higher risk)
             innovation = str(it.get("innovation", "0"))
