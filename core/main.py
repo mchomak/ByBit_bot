@@ -804,6 +804,7 @@ class TradingBot:
                         count = await self._token_sync_service.sync_now()
                         logger.info("Scheduled token sync completed: {} tokens", count)
                         await self._notify(f"Синхронизация токенов: синхронизировано {count} токенов", notify_type="sync")
+                        
                     except Exception as e:
                         logger.error("Token sync failed: {}", e)
                         await self._notify(f"Ошибка синхронизации токенов: {e}", notify_type="error")

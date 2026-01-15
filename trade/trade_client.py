@@ -129,26 +129,72 @@ class _TradeApi:
     
     MAINNET_URL = "https://api.bybit.com"
     DEMO_URL = "https://api-demo.bybit.com"
-    
+
     def __init__(self, api_key: str, api_secret: str, demo: bool = False):
         self.api_key = api_key
         self.api_secret = api_secret
         self.base_url = self.DEMO_URL if demo else self.MAINNET_URL
         self.demo = demo
-        self.recv_window = 5000
+        self.recv_window = 20000  # Increased from 5000 to handle minor clock drift
         self._session: Optional[aiohttp.ClientSession] = None
-    
+        self._time_offset_ms: int = 0  # Offset between local and server time
+        self._time_synced: bool = False
+
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession()
         return self._session
-    
+
     async def close(self):
         if self._session and not self._session.closed:
             await self._session.close()
-    
+
+    async def sync_server_time(self) -> int:
+        """
+        Sync local time with Bybit server time.
+
+        Returns:
+            Time offset in milliseconds (server_time - local_time)
+        """
+        try:
+            session = await self._get_session()
+            local_before = int(time.time() * 1000)
+
+            async with session.get(
+                f"{self.base_url}/v5/market/time",
+                timeout=5
+            ) as resp:
+                data = await resp.json()
+
+            local_after = int(time.time() * 1000)
+
+            if data.get("retCode") == 0:
+                server_time = int(data["result"]["timeSecond"]) * 1000
+                # Use average of before/after to account for network latency
+                local_avg = (local_before + local_after) // 2
+                self._time_offset_ms = server_time - local_avg
+                self._time_synced = True
+
+                if abs(self._time_offset_ms) > 1000:
+                    logger.warning(
+                        "Significant time offset detected: {}ms (server ahead)".format(
+                            self._time_offset_ms
+                        )
+                    )
+                else:
+                    logger.debug("Time synced with Bybit server, offset: {}ms".format(
+                        self._time_offset_ms
+                    ))
+
+                return self._time_offset_ms
+        except Exception as e:
+            logger.warning("Failed to sync server time: {}".format(e))
+
+        return 0
+
     def _get_timestamp(self) -> str:
-        return str(int(time.time() * 1000))
+        """Get timestamp adjusted for server time offset."""
+        return str(int(time.time() * 1000) + self._time_offset_ms)
     
     def _generate_signature(self, timestamp: str, params: str) -> str:
         param_str = f"{timestamp}{self.api_key}{self.recv_window}{params}"
@@ -159,10 +205,25 @@ class _TradeApi:
         ).hexdigest()
     
     async def request(self, method: str, endpoint: str, params: Optional[Dict] = None, signed: bool = True) -> Dict:
+        """Make API request with automatic time sync retry on timestamp errors."""
+        return await self._request_with_retry(method, endpoint, params, signed, retry_on_timestamp=True)
+
+    async def _request_with_retry(
+        self,
+        method: str,
+        endpoint: str,
+        params: Optional[Dict],
+        signed: bool,
+        retry_on_timestamp: bool = True
+    ) -> Dict:
         url = f"{self.base_url}{endpoint}"
         headers = {"Content-Type": "application/json"}
-        
+
         if signed:
+            # Auto-sync time on first signed request
+            if not self._time_synced:
+                await self.sync_server_time()
+
             timestamp = self._get_timestamp()
             param_str = "&".join([f"{k}={v}" for k, v in (params or {}).items()]) if method == "GET" else (json.dumps(params) if params else "")
             signature = self._generate_signature(timestamp, param_str)
@@ -172,27 +233,34 @@ class _TradeApi:
                 "X-BAPI-TIMESTAMP": timestamp,
                 "X-BAPI-RECV-WINDOW": str(self.recv_window)
             })
-        
+
         try:
             session = await self._get_session()
             if method == "GET":
                 async with session.get(url, headers=headers, params=params, timeout=10) as resp:
                     result = await resp.json()
-                    if result is None:
-                        logger.warning(f"Empty response from {endpoint}")
-                        return {"retCode": -1, "retMsg": "Empty response"}
-                    if result.get("retCode") != 0:
-                        logger.debug(f"API error {endpoint}: {result.get('retMsg')}")
-                    return result
             else:
                 async with session.post(url, headers=headers, json=params, timeout=10) as resp:
                     result = await resp.json()
-                    if result is None:
-                        logger.warning(f"Empty response from {endpoint}")
-                        return {"retCode": -1, "retMsg": "Empty response"}
-                    if result.get("retCode") != 0:
-                        logger.debug(f"API error {endpoint}: {result.get('retMsg')}")
-                    return result
+
+            if result is None:
+                logger.warning(f"Empty response from {endpoint}")
+                return {"retCode": -1, "retMsg": "Empty response"}
+
+            # Check for timestamp error and retry with resync
+            if result.get("retCode") != 0:
+                ret_msg = result.get("retMsg", "")
+                if retry_on_timestamp and signed and "timestamp" in ret_msg.lower():
+                    logger.warning(f"Timestamp error, resyncing time: {ret_msg}")
+                    await self.sync_server_time()
+                    # Retry once without further retries
+                    return await self._request_with_retry(
+                        method, endpoint, params, signed, retry_on_timestamp=False
+                    )
+                logger.debug(f"API error {endpoint}: {ret_msg}")
+
+            return result
+
         except asyncio.TimeoutError:
             logger.error(f"Timeout: {endpoint}")
             return {"retCode": -1, "retMsg": "Timeout"}
