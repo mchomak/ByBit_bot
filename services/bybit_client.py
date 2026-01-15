@@ -146,7 +146,7 @@ class BybitClient:
         self._ws_domain = ws_domain.strip()
         self._timeout = aiohttp.ClientTimeout(total=timeout_s)
         self._max_retries = int(max_retries)
-        self._log = logger or logging.getLogger(self.__class__.__name__)
+        self.logger = logger
         self._session: Optional[aiohttp.ClientSession] = None
 
     async def __aenter__(self) -> "BybitClient":
@@ -192,7 +192,7 @@ class BybitClient:
                 if attempt >= self._max_retries:
                     raise
                 sleep_s = (0.8 * (2**attempt)) + random.random() * 0.2
-                self._log.warning(
+                self.logger.warning(
                     "GET %s failed (%s). Retry in %.2fs (attempt %d/%d)",
                     url, str(e), sleep_s, attempt + 1, self._max_retries + 1,
                 )
@@ -215,7 +215,7 @@ class BybitClient:
     # -------------------------------------------------------------------------
 
     @staticmethod
-    def _parse_instruments(category: str, payload: Dict[str, Any]) -> List[BybitInstrument]:
+    def _parse_instruments(category: str, payload: Dict[str, Any], logger: Optional[logging.Logger] = None) -> List[BybitInstrument]:
         result = payload.get("result") or {}
         items = result.get("list") or []
 
@@ -228,23 +228,51 @@ class BybitClient:
                 continue
 
             # Check for ST (Special Treatment) tokens
-            # 1. Bybit may return "innovation" or "riskTag" field for ST tokens
-            # 2. Some ST tokens have "ST" in their symbol name
             is_st = False
 
-            # Check innovation field (for spot) - "1" means innovation zone (higher risk)
-            innovation = str(it.get("innovation", "0"))
-            if innovation == "1":
+            # METHOD 1 (PRIMARY): Check stTag field - this is the official ST marker
+            # stTag='1' means the token is marked as ST (Special Treatment / High Risk)
+            # stTag='0' means normal token
+            st_tag = str(it.get("stTag", "0"))
+            if st_tag == "1":
                 is_st = True
+                logger.debug(f"{symbol} marked as ST (stTag=1)")
 
-            # Check for ST suffix/prefix in symbol (e.g., STUSDT, XXXST)
-            if base_coin.upper().endswith("ST") and len(base_coin) > 2:
-                is_st = True
+            # METHOD 2: Check innovation field (older method, still used for some tokens)
+            # innovation='1' means innovation zone (higher risk)
+            if not is_st:
+                innovation = str(it.get("innovation", "0"))
+                if innovation == "1":
+                    is_st = True
+                    logger.debug(f"{symbol} marked as ST (innovation=1)")
 
-            # Check contractType for risky designation (futures)
-            contract_type = (it.get("contractType") or "").strip()
-            if "ST" in contract_type.upper():
-                is_st = True
+            # METHOD 3: Check symbolType for special designations
+            # Some ST tokens have symbolType like 'adventure', 'innovation', etc.
+            if not is_st:
+                symbol_type = (it.get("symbolType") or "").strip()
+                if symbol_type and symbol_type.lower() in ["adventure", "innovation"]:
+                    is_st = True
+                    logger.debug(f"{symbol} marked as ST (symbolType={symbol_type})")
+
+            # METHOD 4: Check marginTrading status (additional indicator)
+            # ST tokens often have marginTrading='none'
+            # This is NOT a definitive indicator but can be used for validation
+            margin_trading = (it.get("marginTrading") or "").strip()
+            
+            # METHOD 5: Check contractType for risky designation (futures only)
+            if category in ["linear", "inverse"]:
+                contract_type = (it.get("contractType") or "").strip()
+                if "ST" in contract_type.upper():
+                    is_st = True
+                    logger.debug(f"{symbol} marked as ST (contractType={contract_type})")
+
+            # Log ST tokens for monitoring
+            if is_st:
+                logger.info(
+                    f"ST token detected: {symbol} "
+                    f"(stTag={st_tag}, innovation={it.get('innovation', '0')}, "
+                    f"type={it.get('symbolType', 'N/A')}, margin={margin_trading})"
+                )
 
             instruments.append(
                 BybitInstrument(
@@ -292,7 +320,7 @@ class BybitClient:
             payload = await self._get_json("/v5/market/instruments-info", params=params)
             self._ensure_ok(payload)
 
-            for inst in self._parse_instruments(category, payload):
+            for inst in self._parse_instruments(category, payload, self.logger):
                 yield inst
 
             if category == "spot":
@@ -329,7 +357,7 @@ class BybitClient:
             async for inst in self.iter_instruments(category=cat, status=status):
                 if inst.is_st:
                     st_tokens.add(inst.base_coin)
-                    self._log.debug("Found ST token: %s (%s)", inst.base_coin, inst.symbol)
+                    self.logger.debug("Found ST token: %s (%s)", inst.base_coin, inst.symbol)
         return st_tokens
 
     async def check_stale_prices(
@@ -392,7 +420,7 @@ class BybitClient:
                             continue
 
                     if max_consecutive >= consecutive_stale:
-                        self._log.debug(
+                        self.logger.debug(
                             "Stale price detected for %s: %d consecutive flat candles",
                             symbol, max_consecutive
                         )
@@ -401,7 +429,7 @@ class BybitClient:
                     return None
 
                 except Exception as e:
-                    self._log.debug("Failed to check stale prices for %s: %s", symbol, e)
+                    self.logger.debug("Failed to check stale prices for %s: %s", symbol, e)
                     return None
 
         results = await asyncio.gather(*[_check_one(s) for s in symbols])
@@ -411,7 +439,7 @@ class BybitClient:
                 stale_symbols.add(result)
 
         if stale_symbols:
-            self._log.info(
+            self.logger.info(
                 "Found %d symbols with stale prices (>=%d consecutive flat candles)",
                 len(stale_symbols), consecutive_stale
             )
@@ -517,7 +545,7 @@ class BybitClient:
                         "is_confirmed": True,
                     }
                 except Exception as e:  # noqa: BLE001
-                    self._log.debug("Skip malformed kline item for %s: %r (%s)", symbol, item, e)
+                    self.logger.debug("Skip malformed kline item for %s: %r (%s)", symbol, item, e)
 
             oldest_ms = int(page[0][0])
             if oldest_ms <= start_ms:
@@ -579,9 +607,9 @@ class BybitClient:
                             await _insert_batch(session, batch)
                         await session.commit()
 
-                    self._log.info("Seeded %s: %d rows", sym, len(rows))
+                    self.logger.info("Seeded %s: %d rows", sym, len(rows))
                 except Exception as e:
-                    self._log.warning("Failed to seed %s: %s", sym, e)
+                    self.logger.warning("Failed to seed %s: %s", sym, e)
 
         await asyncio.gather(*[_one(s) for s in symbols])
 
@@ -662,7 +690,7 @@ class BybitClient:
           - Auto-reconnects each connection independently
         """
         if not symbols:
-            self._log.warning("No symbols provided for WS stream; exiting")
+            self.logger.warning("No symbols provided for WS stream; exiting")
             return
 
         topics = [f"kline.1.{s}" for s in symbols]
@@ -672,7 +700,7 @@ class BybitClient:
             session_factory=session_factory,
             candle_model=candle_model,
             flush_interval_s=flush_interval_s,
-            logger=self._log,
+            logger=self.logger,
         )
         await buffer.start()
 
@@ -691,7 +719,7 @@ class BybitClient:
                     assert self._session is not None
 
                     ws_url = self._ws_base_url(category)
-                    self._log.info("WS connecting: %s (topics=%d)", ws_url, len(group_topics))
+                    self.logger.info("WS connecting: %s (topics=%d)", ws_url, len(group_topics))
 
                     ws = await self._session.ws_connect(ws_url, autoping=False)
                     ping_task = asyncio.create_task(self._ws_ping_loop(ws), name="bybit-ws-ping")
@@ -736,7 +764,7 @@ class BybitClient:
                                     }
                                     await buffer.add(row)
                                 except Exception as e:  # noqa: BLE001
-                                    self._log.debug("Bad WS kline payload: %r (%s)", c, e)
+                                    self.logger.debug("Bad WS kline payload: %r (%s)", c, e)
 
                         elif msg.type in {aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR}:
                             raise ConnectionError(f"WS closed/error: {msg.type}")
@@ -746,7 +774,7 @@ class BybitClient:
                 except Exception as e:  # noqa: BLE001
                     attempt += 1
                     sleep_s = min(60.0, reconnect_backoff_s * (2 ** min(attempt, 6)))
-                    self._log.warning("WS error: %s. Reconnect in %.1fs", e, sleep_s)
+                    self.logger.warning("WS error: %s. Reconnect in %.1fs", e, sleep_s)
                     await asyncio.sleep(sleep_s)
                 finally:
                     if ping_task:
@@ -801,14 +829,14 @@ class BybitClient:
             stop_event: Optional event to signal graceful shutdown
         """
         if not symbols:
-            self._log.warning("No symbols provided for WS stream; exiting")
+            self.logger.warning("No symbols provided for WS stream; exiting")
             return
 
         stop = stop_event or asyncio.Event()
         topics = [f"kline.1.{s}" for s in symbols]
         topic_groups = self._split_topics_for_connection(topics)
 
-        self._log.info(
+        self.logger.info(
             "Starting WS kline stream: %d symbols, %d connections",
             len(symbols), len(topic_groups)
         )
@@ -826,7 +854,7 @@ class BybitClient:
                     assert self._session is not None
 
                     ws_url = self._ws_base_url(category)
-                    self._log.info(
+                    self.logger.info(
                         "[conn-%d] Connecting to %s (topics=%d)",
                         conn_id, ws_url, len(group_topics)
                     )
@@ -875,11 +903,11 @@ class BybitClient:
                                             if metrics:
                                                 metrics.ws_messages_received += 1
                                         except asyncio.QueueFull:
-                                            self._log.warning(
+                                            self.logger.warning(
                                                 "Queue full, dropping update for %s", sym
                                             )
                                 except Exception as e:
-                                    self._log.debug("Bad kline payload: %r (%s)", c, e)
+                                    self.logger.debug("Bad kline payload: %r (%s)", c, e)
 
                         elif msg.type in {aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR}:
                             raise ConnectionError(f"WS closed/error: {msg.type}")
@@ -891,7 +919,7 @@ class BybitClient:
                         break
                     attempt += 1
                     sleep_s = min(60.0, reconnect_backoff_s * (2 ** min(attempt, 6)))
-                    self._log.warning(
+                    self.logger.warning(
                         "[conn-%d] Error: %s. Reconnect in %.1fs",
                         conn_id, e, sleep_s
                     )
