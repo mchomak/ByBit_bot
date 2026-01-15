@@ -95,7 +95,7 @@ class StalePriceChecker:
         try:
             await self.check_and_update()
         except Exception as e:
-            self._log.error("Error in initial stale price check: {}", e)
+            self._log.error("Error in initial stale price check: {}".format(e))
 
         while not self._stop_event.is_set():
             # Wait for next check
@@ -111,7 +111,7 @@ class StalePriceChecker:
             try:
                 await self.check_and_update()
             except Exception as e:
-                self._log.error("Error in stale price check: {}", e)
+                self._log.error("Error in stale price check: {}".format(e))
 
     async def check_and_update(self) -> dict:
         """
