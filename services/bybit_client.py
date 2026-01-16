@@ -330,15 +330,23 @@ class BybitClient:
         self,
         categories: List[str],
         status: Optional[str] = "Trading",
+        quote_coin: str = "USDT",
     ) -> Set[str]:
         """
         Get set of ST (Special Treatment / high-risk) tokens.
+
+        Only checks pairs with specified quote_coin (default USDT) to avoid
+        false positives from other pairs like ETHDAI marking ETH as ST.
 
         Returns baseCoin symbols that are marked as ST by Bybit.
         """
         st_tokens: Set[str] = set()
         for cat in categories:
             async for inst in self.iter_instruments(category=cat, status=status):
+                # Only check USDT pairs to avoid false positives
+                # (e.g., ETHDAI is ST but ETHUSDT is not)
+                if inst.quote_coin.upper() != quote_coin.upper():
+                    continue
                 if inst.is_st:
                     st_tokens.add(inst.base_coin)
                     self.logger.debug("Found ST token: %s (%s)", inst.base_coin, inst.symbol)
