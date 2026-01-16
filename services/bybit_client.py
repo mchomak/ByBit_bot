@@ -146,7 +146,7 @@ class BybitClient:
         self._ws_domain = ws_domain.strip()
         self._timeout = aiohttp.ClientTimeout(total=timeout_s)
         self._max_retries = int(max_retries)
-        self.logger = logger
+        self.logger = logger or logging.getLogger(self.__class__.__name__)
         self._session: Optional[aiohttp.ClientSession] = None
 
     async def __aenter__(self) -> "BybitClient":
@@ -218,6 +218,7 @@ class BybitClient:
     def _parse_instruments(category: str, payload: Dict[str, Any], logger: Optional[logging.Logger] = None) -> List[BybitInstrument]:
         result = payload.get("result") or {}
         items = result.get("list") or []
+        log = logger or logging.getLogger("BybitClient")
 
         instruments: List[BybitInstrument] = []
         for it in items:
@@ -236,7 +237,6 @@ class BybitClient:
             st_tag = str(it.get("stTag", "0"))
             if st_tag == "1":
                 is_st = True
-                logger.debug(f"{symbol} marked as ST (stTag=1)")
 
             # METHOD 2: Check innovation field (older method, still used for some tokens)
             # innovation='1' means innovation zone (higher risk)
@@ -244,7 +244,6 @@ class BybitClient:
                 innovation = str(it.get("innovation", "0"))
                 if innovation == "1":
                     is_st = True
-                    logger.debug(f"{symbol} marked as ST (innovation=1)")
 
             # METHOD 3: Check symbolType for special designations
             # Some ST tokens have symbolType like 'adventure', 'innovation', etc.
@@ -252,26 +251,23 @@ class BybitClient:
                 symbol_type = (it.get("symbolType") or "").strip()
                 if symbol_type and symbol_type.lower() in ["adventure", "innovation"]:
                     is_st = True
-                    logger.debug(f"{symbol} marked as ST (symbolType={symbol_type})")
 
-            # METHOD 4: Check marginTrading status (additional indicator)
-            # ST tokens often have marginTrading='none'
-            # This is NOT a definitive indicator but can be used for validation
-            margin_trading = (it.get("marginTrading") or "").strip()
-            
+            # METHOD 4: Check for ST suffix in baseCoin (e.g., XXXST)
+            if not is_st:
+                if base_coin.upper().endswith("ST") and len(base_coin) > 2:
+                    is_st = True
+
             # METHOD 5: Check contractType for risky designation (futures only)
-            if category in ["linear", "inverse"]:
+            if not is_st and category in ["linear", "inverse"]:
                 contract_type = (it.get("contractType") or "").strip()
                 if "ST" in contract_type.upper():
                     is_st = True
-                    logger.debug(f"{symbol} marked as ST (contractType={contract_type})")
 
-            # Log ST tokens for monitoring
+            # Log ST tokens for monitoring (only at debug level to avoid spam)
             if is_st:
-                logger.info(
-                    f"ST token detected: {symbol} "
-                    f"(stTag={st_tag}, innovation={it.get('innovation', '0')}, "
-                    f"type={it.get('symbolType', 'N/A')}, margin={margin_trading})"
+                log.debug(
+                    "ST token detected: %s (stTag=%s, innovation=%s)",
+                    symbol, st_tag, it.get('innovation', '0')
                 )
 
             instruments.append(
