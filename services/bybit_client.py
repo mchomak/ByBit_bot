@@ -238,26 +238,14 @@ class BybitClient:
             if st_tag == "1":
                 is_st = True
 
-            # METHOD 2: Check innovation field (older method, still used for some tokens)
+            # METHOD 2: Check innovation field
             # innovation='1' means innovation zone (higher risk)
             if not is_st:
                 innovation = str(it.get("innovation", "0"))
                 if innovation == "1":
                     is_st = True
 
-            # METHOD 3: Check symbolType for special designations
-            # Some ST tokens have symbolType like 'adventure', 'innovation', etc.
-            if not is_st:
-                symbol_type = (it.get("symbolType") or "").strip()
-                if symbol_type and symbol_type.lower() in ["adventure", "innovation"]:
-                    is_st = True
-
-            # METHOD 4: Check for ST suffix in baseCoin (e.g., XXXST)
-            if not is_st:
-                if base_coin.upper().endswith("ST") and len(base_coin) > 2:
-                    is_st = True
-
-            # METHOD 5: Check contractType for risky designation (futures only)
+            # METHOD 3: Check contractType for risky designation (futures only)
             if not is_st and category in ["linear", "inverse"]:
                 contract_type = (it.get("contractType") or "").strip()
                 if "ST" in contract_type.upper():
