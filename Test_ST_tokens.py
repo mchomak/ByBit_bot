@@ -195,7 +195,7 @@ if __name__ == "__main__":
     checker = BybitRiskChecker(testnet=False)
     
     # Тестируем токены из вашего примера
-    test_tokens = ['SOLUSDT', 'VENOMUSDT', 'MEMEFIUSDT', 'BTCUSDT']
+    test_tokens = ['ETHUSDT', 'VENOMUSDT', 'MEMEFIUSDT', 'BTCUSDT']
     
     for token in test_tokens:
         is_st = checker.is_high_risk(token)
