@@ -665,6 +665,7 @@ class TradingBot:
             min_trade_usdt=settings.min_trade_amount_usdt,
             get_balance_fn=get_balance_fn,
             place_order_fn=place_order_fn,
+            telegram_queue=self._telegram_queue,
             metrics=self._metrics,
         )
 
