@@ -24,6 +24,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy import select
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from db.models import Token
 from services.pipeline_events import PipelineMetrics, SignalType, TradingSignal
 
 
@@ -271,6 +272,15 @@ class ExecutionEngine:
                 symbol
             )
             await self._update_signal_execution(signal, False, "Token disabled (recent loss)")
+            return
+
+        # Gate check 1.5: Token is_active=False in database (stale price)?
+        if not await self._is_token_active(symbol):
+            self._log.info(
+                "Skipping entry for %s: token is_active=False in database (stale price)",
+                symbol
+            )
+            await self._update_signal_execution(signal, False, "Token inactive (stale price)")
             return
 
         # Gate check 2: Already have position for this symbol?
@@ -536,6 +546,41 @@ class ExecutionEngine:
             )
 
             await self._update_signal_execution(signal, False, error_msg)
+
+    async def _is_token_active(self, symbol: str) -> bool:
+        """
+        Check if token is active in the database.
+
+        Checks the Token table for is_active=True.
+        Tokens with stale prices are set to is_active=False by StalePriceChecker.
+
+        Args:
+            symbol: The trading pair symbol (e.g., "BTCUSDT")
+
+        Returns:
+            True if token is active, False if inactive or not found
+        """
+        try:
+            async with self._session_factory() as session:
+                result = await session.execute(
+                    select(Token.is_active).where(Token.bybit_symbol == symbol)
+                )
+                row = result.scalar_one_or_none()
+
+                if row is None:
+                    # Token not found in database - don't trade unknown tokens
+                    self._log.warning(
+                        "Token %s not found in database, treating as inactive",
+                        symbol
+                    )
+                    return False
+
+                return bool(row)
+
+        except Exception as e:
+            self._log.exception("Failed to check token active status: %s", e)
+            # On error, default to allowing trade (don't block due to DB issues)
+            return True
 
     async def _get_available_balance(self) -> float:
         """Get available USDT balance."""
