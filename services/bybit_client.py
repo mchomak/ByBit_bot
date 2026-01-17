@@ -358,19 +358,22 @@ class BybitClient:
         symbols: List[str],
         lookback_minutes: int = 50,
         stale_ratio_threshold: float = 0.8,
+        consecutive_flat_threshold: int = 3,
         concurrency: int = 10,
     ) -> Set[str]:
         """
         Check for symbols with stale prices (no price movement).
 
-        A symbol is considered stale if the ratio of flat candles
-        (open == close) exceeds the threshold in the lookback period.
+        A symbol is considered stale if EITHER:
+        1. Ratio of flat candles (open == close) >= threshold (default 80%)
+        2. OR at least N consecutive flat candles found (default 3)
 
         Args:
             category: Bybit category (spot, linear, etc.)
             symbols: List of symbols to check
             lookback_minutes: How many minutes of history to check
             stale_ratio_threshold: Ratio of flat candles to consider stale (0.8 = 80%)
+            consecutive_flat_threshold: Min consecutive flat candles to consider stale
             concurrency: Max concurrent API requests
 
         Returns:
@@ -393,9 +396,11 @@ class BybitClient:
                     if not raw or len(raw) < 10:  # Need at least 10 candles
                         return None
 
-                    # Count flat candles (open == close)
+                    # Count flat candles and track consecutive
                     flat_count = 0
                     total_count = 0
+                    consecutive_flat = 0
+                    max_consecutive_flat = 0
 
                     for candle in raw:
                         try:
@@ -405,6 +410,10 @@ class BybitClient:
 
                             if open_price == close_price:
                                 flat_count += 1
+                                consecutive_flat += 1
+                                max_consecutive_flat = max(max_consecutive_flat, consecutive_flat)
+                            else:
+                                consecutive_flat = 0
                         except (IndexError, ValueError):
                             continue
 
@@ -413,10 +422,20 @@ class BybitClient:
 
                     flat_ratio = flat_count / total_count
 
-                    if flat_ratio >= stale_ratio_threshold:
+                    # Check BOTH conditions (hybrid approach)
+                    is_stale_by_ratio = flat_ratio >= stale_ratio_threshold
+                    is_stale_by_consecutive = max_consecutive_flat >= consecutive_flat_threshold
+
+                    if is_stale_by_ratio or is_stale_by_consecutive:
+                        reason = []
+                        if is_stale_by_ratio:
+                            reason.append(f"{flat_ratio*100:.0f}% flat")
+                        if is_stale_by_consecutive:
+                            reason.append(f"{max_consecutive_flat} consecutive")
+
                         self.logger.debug(
-                            "Stale price detected for %s: %.1f%% flat candles (%d/%d)",
-                            symbol, flat_ratio * 100, flat_count, total_count
+                            "Stale price detected for %s: %s (%d/%d candles)",
+                            symbol, " + ".join(reason), flat_count, total_count
                         )
                         return symbol
 
@@ -434,8 +453,8 @@ class BybitClient:
 
         if stale_symbols:
             self.logger.info(
-                "Found %d symbols with stale prices (>=%.0f%% flat candles)",
-                len(stale_symbols), stale_ratio_threshold * 100
+                "Found %d symbols with stale prices (>=%.0f%% flat OR >=%d consecutive)",
+                len(stale_symbols), stale_ratio_threshold * 100, consecutive_flat_threshold
             )
 
         return stale_symbols

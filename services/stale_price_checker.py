@@ -36,6 +36,7 @@ class StalePriceChecker:
         check_interval_minutes: int = 50,
         lookback_minutes: int = 50,
         stale_ratio_threshold: float = 0.8,
+        consecutive_flat_threshold: int = 3,
         logger: Optional[logging.Logger] = None,
     ):
         """
@@ -47,6 +48,7 @@ class StalePriceChecker:
             check_interval_minutes: How often to check (default 50 min)
             lookback_minutes: How many minutes of history to check
             stale_ratio_threshold: Ratio of flat candles to consider stale (0.8 = 80%)
+            consecutive_flat_threshold: Min consecutive flat candles to consider stale (default 3)
             logger: Logger instance
         """
         self._session_factory = session_factory
@@ -54,6 +56,7 @@ class StalePriceChecker:
         self._interval_minutes = check_interval_minutes
         self._lookback_minutes = lookback_minutes
         self._stale_ratio = stale_ratio_threshold
+        self._consecutive_threshold = consecutive_flat_threshold
         self._log = logger or logging.getLogger(self.__class__.__name__)
 
         self._task: Optional[asyncio.Task] = None
@@ -68,10 +71,12 @@ class StalePriceChecker:
         self._stop_event.clear()
         self._task = asyncio.create_task(self._run_loop(), name="stale-price-checker")
         self._log.info(
-            "Stale price checker started (interval: {} min, lookback: {} min, threshold: {}%)".format(
+            "Stale price checker started (interval: {} min, lookback: {} min, "
+            "ratio: {}%, consecutive: {})".format(
                 self._interval_minutes,
                 self._lookback_minutes,
                 int(self._stale_ratio * 100),
+                self._consecutive_threshold,
             )
         )
 
@@ -137,13 +142,14 @@ class StalePriceChecker:
             symbols = [t.bybit_symbol for t in all_tokens]
             stats["checked"] = len(symbols)
 
-            # Check for stale prices via Bybit API
+            # Check for stale prices via Bybit API (hybrid: ratio OR consecutive)
             async with BybitClient(logger=self._log) as bybit:
                 stale_symbols = await bybit.check_stale_prices(
                     category=self._category,
                     symbols=symbols,
                     lookback_minutes=self._lookback_minutes,
                     stale_ratio_threshold=self._stale_ratio,
+                    consecutive_flat_threshold=self._consecutive_threshold,
                 )
 
             # Update is_active based on stale check
