@@ -891,7 +891,7 @@ class TradingBot:
             bybit_category=settings.bybit_category,
             check_interval_minutes=50,
             lookback_minutes=50,
-            consecutive_stale_candles=3,
+            stale_ratio_threshold=0.8,  # 80% flat candles = stale
         )
         await self._stale_price_checker.start()
         logger.info("Stale price checker started (runs every 50 minutes)")
