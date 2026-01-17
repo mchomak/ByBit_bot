@@ -24,6 +24,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy import select
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from db.models import Token, AllToken
 from services.pipeline_events import PipelineMetrics, SignalType, TradingSignal
 
 
@@ -106,9 +107,7 @@ class ExecutionEngine:
         self._exit_cooldown_minutes = 5  # Wait 5 minutes between exit retry attempts
         self._max_exit_failures = 3  # After 3 failures, mark position as stuck
 
-        # Track temporarily disabled tokens (cleared on daily token sync)
-        # Tokens are disabled when closed with loss > threshold
-        self._disabled_tokens: Set[str] = set()
+        # Loss threshold for disabling tokens (stored in database as BigLoss)
         self._disable_loss_threshold_pct = -1.0  # Disable if loss exceeds 1%
 
         # Task handle
@@ -264,13 +263,14 @@ class ExecutionEngine:
         """Handle an entry signal."""
         symbol = signal.symbol
 
-        # Gate check 1: Token temporarily disabled (lost > 1% recently)?
-        if symbol in self._disabled_tokens:
+        # Gate check 1: Token not in tokens table or is_active=False?
+        # Reasons: StalePrice, BigLoss, or removed during daily sync
+        if not await self._is_token_active(symbol):
             self._log.info(
-                "Skipping entry for %s: token disabled due to recent loss",
+                "Skipping entry for %s: token inactive in database",
                 symbol
             )
-            await self._update_signal_execution(signal, False, "Token disabled (recent loss)")
+            await self._update_signal_execution(signal, False, "Token inactive in database")
             return
 
         # Gate check 2: Already have position for this symbol?
@@ -537,6 +537,41 @@ class ExecutionEngine:
 
             await self._update_signal_execution(signal, False, error_msg)
 
+    async def _is_token_active(self, symbol: str) -> bool:
+        """
+        Check if token is active in the database.
+
+        Checks the Token table for is_active=True.
+        Tokens with stale prices are set to is_active=False by StalePriceChecker.
+
+        Args:
+            symbol: The trading pair symbol (e.g., "BTCUSDT")
+
+        Returns:
+            True if token is active, False if inactive or not found
+        """
+        try:
+            async with self._session_factory() as session:
+                result = await session.execute(
+                    select(Token.is_active).where(Token.bybit_symbol == symbol)
+                )
+                row = result.scalar_one_or_none()
+
+                if row is None:
+                    # Token not found in database - don't trade unknown tokens
+                    self._log.warning(
+                        "Token %s not found in database, treating as inactive",
+                        symbol
+                    )
+                    return False
+
+                return bool(row)
+
+        except Exception as e:
+            self._log.exception("Failed to check token active status: %s", e)
+            # On error, default to allowing trade (don't block due to DB issues)
+            return True
+
     async def _get_available_balance(self) -> float:
         """Get available USDT balance."""
         if self._get_balance:
@@ -782,42 +817,51 @@ class ExecutionEngine:
         except Exception as e:
             self._log.debug("Failed to update signal execution: %s", e)
 
-    def disable_token(self, symbol: str, loss_pct: float) -> None:
+    async def disable_token_for_loss(self, symbol: str, loss_pct: float) -> bool:
         """
-        Temporarily disable a token from trading.
+        Disable a token due to significant trading loss.
 
-        Called when a position closes with significant loss (> threshold).
-        Token remains disabled until daily token sync clears the list.
+        Removes token from 'tokens' table and marks it in 'all_tokens'
+        with deactivation_reason='BigLoss'. Token will be re-enabled
+        during the next daily sync if it passes all filters.
 
         Args:
-            symbol: Token symbol to disable
+            symbol: Trading pair symbol (e.g., "BTCUSDT")
             loss_pct: Percentage loss (negative value)
-        """
-        self._disabled_tokens.add(symbol)
-        self._log.warning(
-            "Token %s DISABLED for trading (loss: %.2f%%, threshold: %.2f%%)",
-            symbol, loss_pct, self._disable_loss_threshold_pct
-        )
-
-    def clear_disabled_tokens(self) -> int:
-        """
-        Clear all temporarily disabled tokens.
-
-        Called during daily token sync to give tokens another chance.
 
         Returns:
-            Number of tokens that were cleared
+            True if token was disabled, False on error
         """
-        count = len(self._disabled_tokens)
-        if count > 0:
-            symbols = list(self._disabled_tokens)
-            self._disabled_tokens.clear()
-            self._log.info(
-                "Cleared %d disabled tokens: %s",
-                count, ", ".join(symbols)
-            )
-        return count
+        try:
+            # Extract base symbol (e.g., "BTC" from "BTCUSDT")
+            base_symbol = symbol.replace("USDT", "").replace("USDC", "")
 
-    def get_disabled_tokens(self) -> Set[str]:
-        """Get the set of currently disabled tokens."""
-        return self._disabled_tokens.copy()
+            async with self._session_factory() as session:
+                from sqlalchemy import delete, update
+
+                # 1. Delete from tokens table
+                delete_stmt = delete(Token).where(Token.bybit_symbol == symbol)
+                await session.execute(delete_stmt)
+
+                # 2. Update all_tokens with BigLoss reason
+                update_stmt = (
+                    update(AllToken)
+                    .where(AllToken.bybit_symbol == symbol)
+                    .values(
+                        is_active=False,
+                        deactivation_reason="BigLoss",
+                    )
+                )
+                await session.execute(update_stmt)
+                await session.commit()
+
+            self._log.warning(
+                "Token %s DISABLED for trading (loss: %.2f%%, threshold: %.2f%%). "
+                "Will be re-enabled on next daily sync.",
+                symbol, loss_pct, self._disable_loss_threshold_pct
+            )
+            return True
+
+        except Exception as e:
+            self._log.exception("Failed to disable token %s: %s", symbol, e)
+            return False

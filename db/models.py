@@ -124,6 +124,7 @@ class AllToken(Base):
     - LowMcap: Low market cap or not available on Bybit
     - New: Token appeared on exchange < 24h ago
     - StalePrice: Inactive price (checked every 50 min)
+    - BigLoss: Token had significant trading loss (re-enabled on daily sync)
     """
 
     __tablename__ = "all_tokens"

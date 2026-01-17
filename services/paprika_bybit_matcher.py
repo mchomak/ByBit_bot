@@ -208,7 +208,7 @@ async def sync_tokens_to_database(
             log.info("Checking for ST (Special Treatment / high-risk) tokens...")
             st_tokens = await bybit.get_st_tokens(categories=bybit_categories)
             if st_tokens:
-                log.info("Found %d ST tokens to exclude: %s", len(st_tokens), sorted(st_tokens)[:20])
+                log.info("Found %d ST tokens on Bybit: %s", len(st_tokens), sorted(st_tokens)[:20])
 
         # Collect ALL tokens for all_tokens table
         all_tokens_data: List[Dict[str, Any]] = []
@@ -260,7 +260,7 @@ async def sync_tokens_to_database(
         if blacklisted_count > 0:
             log.info(f"Filtered {blacklisted_count} blacklisted tokens")
         if st_filtered_count > 0:
-            log.info(f"Filtered {st_filtered_count} ST (high-risk) tokens")
+            log.info(f"Filtered {st_filtered_count} ST (high-risk) tokens from candidates")
 
         # Sort by market cap
         all_tokens_data.sort(key=lambda x: x["market_cap_usd"], reverse=True)

@@ -357,20 +357,20 @@ class BybitClient:
         category: str,
         symbols: List[str],
         lookback_minutes: int = 50,
-        consecutive_stale: int = 3,
+        stale_ratio_threshold: float = 0.8,
         concurrency: int = 10,
     ) -> Set[str]:
         """
         Check for symbols with stale prices (no price movement).
 
-        A symbol is considered stale if for N or more consecutive minutes
-        the open price equals the close price (no trading activity).
+        A symbol is considered stale if the ratio of flat candles
+        (open == close) exceeds the threshold in the lookback period.
 
         Args:
             category: Bybit category (spot, linear, etc.)
             symbols: List of symbols to check
             lookback_minutes: How many minutes of history to check
-            consecutive_stale: Number of consecutive stale candles to trigger filter
+            stale_ratio_threshold: Ratio of flat candles to consider stale (0.8 = 80%)
             concurrency: Max concurrent API requests
 
         Returns:
@@ -390,31 +390,33 @@ class BybitClient:
                         limit=lookback_minutes,
                     )
 
-                    if not raw or len(raw) < consecutive_stale:
+                    if not raw or len(raw) < 10:  # Need at least 10 candles
                         return None
 
-                    # Check for consecutive stale candles (open == close)
-                    max_consecutive = 0
-                    current_streak = 0
+                    # Count flat candles (open == close)
+                    flat_count = 0
+                    total_count = 0
 
-                    # raw is sorted newest->oldest, reverse for chronological order
-                    for candle in reversed(raw):
+                    for candle in raw:
                         try:
                             open_price = float(candle[1])
                             close_price = float(candle[4])
+                            total_count += 1
 
                             if open_price == close_price:
-                                current_streak += 1
-                                max_consecutive = max(max_consecutive, current_streak)
-                            else:
-                                current_streak = 0
+                                flat_count += 1
                         except (IndexError, ValueError):
                             continue
 
-                    if max_consecutive >= consecutive_stale:
+                    if total_count == 0:
+                        return None
+
+                    flat_ratio = flat_count / total_count
+
+                    if flat_ratio >= stale_ratio_threshold:
                         self.logger.debug(
-                            "Stale price detected for %s: %d consecutive flat candles",
-                            symbol, max_consecutive
+                            "Stale price detected for %s: %.1f%% flat candles (%d/%d)",
+                            symbol, flat_ratio * 100, flat_count, total_count
                         )
                         return symbol
 
@@ -432,8 +434,8 @@ class BybitClient:
 
         if stale_symbols:
             self.logger.info(
-                "Found %d symbols with stale prices (>=%d consecutive flat candles)",
-                len(stale_symbols), consecutive_stale
+                "Found %d symbols with stale prices (>=%.0f%% flat candles)",
+                len(stale_symbols), stale_ratio_threshold * 100
             )
 
         return stale_symbols

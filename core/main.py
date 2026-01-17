@@ -313,6 +313,31 @@ class TradingBot:
         assert self._repository is not None
         assert self._db is not None
 
+        # Check existing tokens with is_active=True
+        tokens = await self._repository.get_all(
+            Token,
+            filters={"is_active": True},
+            limit=settings.max_symbols if settings.max_symbols > 0 else None
+        )
+
+        if tokens:
+            logger.info("Loaded {} active tokens from database", len(tokens))
+            # Filter by current category
+            category = settings.bybit_category.lower()
+            symbols = [
+                t.bybit_symbol for t in tokens
+                if t.bybit_categories and category in t.bybit_categories.lower()
+            ]
+            logger.info("Filtered to {} symbols for category '{}'", len(symbols), category)
+
+            # Filter out tokens that appeared less than 24h ago
+            symbols = await self._filter_new_tokens(symbols)
+
+            return symbols
+
+        # No tokens - run initial sync
+        logger.info("No tokens in database, running initial sync...")
+
         self._token_sync_service = TokenSyncService(
             repository=self._repository,
             market_cap_threshold_usd=settings.min_market_cap_usd,
@@ -804,7 +829,6 @@ class TradingBot:
                         count = await self._token_sync_service.sync_now()
                         logger.info("Scheduled token sync completed: {} tokens", count)
                         await self._notify(f"Синхронизация токенов: синхронизировано {count} токенов", notify_type="sync")
-                        
                     except Exception as e:
                         logger.error("Token sync failed: {}", e)
                         await self._notify(f"Ошибка синхронизации токенов: {e}", notify_type="error")
@@ -867,7 +891,7 @@ class TradingBot:
             bybit_category=settings.bybit_category,
             check_interval_minutes=50,
             lookback_minutes=50,
-            consecutive_stale_candles=3,
+            stale_ratio_threshold=0.8,  # 80% flat candles = stale
         )
         await self._stale_price_checker.start()
         logger.info("Stale price checker started (runs every 50 minutes)")

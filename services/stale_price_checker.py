@@ -35,7 +35,7 @@ class StalePriceChecker:
         bybit_category: str = "spot",
         check_interval_minutes: int = 50,
         lookback_minutes: int = 50,
-        consecutive_stale_candles: int = 3,
+        stale_ratio_threshold: float = 0.8,
         logger: Optional[logging.Logger] = None,
     ):
         """
@@ -46,14 +46,14 @@ class StalePriceChecker:
             bybit_category: Bybit category to check (spot, linear)
             check_interval_minutes: How often to check (default 50 min)
             lookback_minutes: How many minutes of history to check
-            consecutive_stale_candles: Number of flat candles to consider stale
+            stale_ratio_threshold: Ratio of flat candles to consider stale (0.8 = 80%)
             logger: Logger instance
         """
         self._session_factory = session_factory
         self._category = bybit_category
         self._interval_minutes = check_interval_minutes
         self._lookback_minutes = lookback_minutes
-        self._consecutive_stale = consecutive_stale_candles
+        self._stale_ratio = stale_ratio_threshold
         self._log = logger or logging.getLogger(self.__class__.__name__)
 
         self._task: Optional[asyncio.Task] = None
@@ -68,10 +68,10 @@ class StalePriceChecker:
         self._stop_event.clear()
         self._task = asyncio.create_task(self._run_loop(), name="stale-price-checker")
         self._log.info(
-            "Stale price checker started (interval: {} min, lookback: {} min, consecutive: {})".format(
+            "Stale price checker started (interval: {} min, lookback: {} min, threshold: {}%)".format(
                 self._interval_minutes,
                 self._lookback_minutes,
-                self._consecutive_stale,
+                int(self._stale_ratio * 100),
             )
         )
 
@@ -143,7 +143,7 @@ class StalePriceChecker:
                     category=self._category,
                     symbols=symbols,
                     lookback_minutes=self._lookback_minutes,
-                    consecutive_stale=self._consecutive_stale,
+                    stale_ratio_threshold=self._stale_ratio,
                 )
 
             # Update is_active based on stale check
