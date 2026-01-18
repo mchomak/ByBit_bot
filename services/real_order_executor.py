@@ -764,7 +764,7 @@ class RealOrderExecutorService:
             return
 
         try:
-            current_time = datetime.now().strftime("%H:%M:%S")
+            current_time = datetime.now().strftime("%d-%m-%Y %H:%M:%S")
             symbol = context.get("symbol", "")
             side = context.get("side", "")
             coin = symbol.replace("USDT", "").replace("USDC", "")
