@@ -810,11 +810,8 @@ class TradingBot:
                 # Run sync
                 logger.info("Starting scheduled token sync...")
 
-                # Clear disabled tokens - give them another chance
-                if self._execution_engine:
-                    cleared = self._execution_engine.clear_disabled_tokens()
-                    if cleared > 0:
-                        logger.info("Cleared {} disabled tokens during sync", cleared)
+                # Note: BigLoss tokens are automatically re-enabled during sync
+                # when sync_tokens_to_database() re-evaluates all tokens
 
                 if self._token_sync_service and self._repository:
                     try:
