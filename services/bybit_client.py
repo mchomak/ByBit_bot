@@ -352,6 +352,54 @@ class BybitClient:
                     self.logger.debug("Found ST token: %s (%s)", inst.base_coin, inst.symbol)
         return st_tokens
 
+    async def get_24h_volumes(
+        self,
+        category: str,
+        symbols: Optional[List[str]] = None,
+    ) -> Dict[str, float]:
+        """
+        Get 24h trading volume (turnover in USDT) for symbols.
+
+        Args:
+            category: Bybit category (spot, linear)
+            symbols: Optional list of symbols to filter (if None, returns all)
+
+        Returns:
+            Dict mapping symbol -> 24h turnover in USDT
+        """
+        volumes: Dict[str, float] = {}
+
+        try:
+            params = {"category": category}
+            payload = await self._get_json("/v5/market/tickers", params=params)
+            self._ensure_ok(payload)
+
+            result = payload.get("result", {})
+            tickers = result.get("list", [])
+
+            for ticker in tickers:
+                symbol = ticker.get("symbol", "")
+                turnover_24h = ticker.get("turnover24h", "0")
+
+                try:
+                    turnover = float(turnover_24h)
+                except (ValueError, TypeError):
+                    turnover = 0.0
+
+                # Filter by symbols if provided
+                if symbols is None or symbol in symbols:
+                    volumes[symbol] = turnover
+
+            self.logger.debug(
+                "Fetched 24h volumes for %d symbols (category=%s)",
+                len(volumes), category
+            )
+
+        except Exception as e:
+            self.logger.error("Failed to fetch 24h volumes: %s", e)
+
+        return volumes
+
     async def check_stale_prices(
         self,
         category: str,

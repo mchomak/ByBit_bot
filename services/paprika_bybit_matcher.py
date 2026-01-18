@@ -150,19 +150,21 @@ async def sync_tokens_to_database(
     symbol_aliases: Optional[Dict[str, str]] = None,
     logger: Optional[logging.Logger] = None,
     filter_st_tokens: bool = True,
+    volume_threshold_usd: float = 700_000,
 ) -> int:
     """
     Синхронизирует токены в БД (daily sync).
 
-    Applies 4 main filters (NOT StalePrice - that's separate):
+    Applies 5 main filters (NOT StalePrice - that's separate):
     1) Market cap threshold
     2) Blacklist
     3) ST (Special Treatment / high-risk)
     4) Available on Bybit
+    5) 24h volume >= threshold
 
     Two-table structure:
     - all_tokens: stores ALL tokens with deactivation_reason
-    - tokens: stores only tradable tokens (passed all 4 filters)
+    - tokens: stores only tradable tokens (passed all 5 filters)
 
     StalePrice is NOT checked here - it runs separately every 50 minutes.
 
@@ -173,6 +175,7 @@ async def sync_tokens_to_database(
         symbol_aliases: Словарь алиасов для нормализации символов
         logger: Logger instance
         filter_st_tokens: Исключать ST (Special Treatment) токены
+        volume_threshold_usd: Минимальный 24h объём торгов в USD (default $700k)
 
     Returns:
         Количество активных (tradable) токенов
@@ -210,6 +213,14 @@ async def sync_tokens_to_database(
             if st_tokens:
                 log.info("Found %d ST tokens on Bybit: %s", len(st_tokens), sorted(st_tokens)[:20])
 
+        # Get 24h volumes for volume filtering
+        log.info("Fetching 24h trading volumes...")
+        volumes_24h: Dict[str, float] = {}
+        for cat in bybit_categories:
+            cat_volumes = await bybit.get_24h_volumes(category=cat)
+            volumes_24h.update(cat_volumes)
+        log.info("Fetched 24h volumes for %d symbols", len(volumes_24h))
+
         # Collect ALL tokens for all_tokens table
         all_tokens_data: List[Dict[str, Any]] = []
         # Collect only active tokens for tokens table
@@ -217,6 +228,7 @@ async def sync_tokens_to_database(
 
         blacklisted_count = 0
         st_filtered_count = 0
+        low_volume_count = 0
 
         for t in candidates:
             normalized_symbol = _apply_symbol_aliases(t.symbol, aliases)
@@ -245,6 +257,12 @@ async def sync_tokens_to_database(
             elif normalized_symbol.upper() in st_tokens:
                 deactivation_reason = "ST"
                 st_filtered_count += 1
+            else:
+                # Check 24h volume (only if not already filtered)
+                volume_24h = volumes_24h.get(bybit_symbol, 0)
+                if volume_24h < volume_threshold_usd:
+                    deactivation_reason = "LowVolume"
+                    low_volume_count += 1
 
             # Add to all_tokens with reason
             all_tokens_data.append({
@@ -261,6 +279,8 @@ async def sync_tokens_to_database(
             log.info(f"Filtered {blacklisted_count} blacklisted tokens")
         if st_filtered_count > 0:
             log.info(f"Filtered {st_filtered_count} ST (high-risk) tokens from candidates")
+        if low_volume_count > 0:
+            log.info(f"Filtered {low_volume_count} tokens with 24h volume < ${volume_threshold_usd:,.0f}")
 
         # Sort by market cap
         all_tokens_data.sort(key=lambda x: x["market_cap_usd"], reverse=True)
@@ -342,7 +362,8 @@ async def sync_tokens_to_database(
             f"Token sync completed: {len(all_tokens_data)} total, "
             f"{len(active_tokens_data)} tradable, "
             f"{blacklisted_count} blacklisted, "
-            f"{st_filtered_count} ST filtered"
+            f"{st_filtered_count} ST, "
+            f"{low_volume_count} low volume"
         )
 
         return len(active_tokens_data)
