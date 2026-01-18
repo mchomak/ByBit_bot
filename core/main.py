@@ -665,6 +665,7 @@ class TradingBot:
             min_trade_usdt=settings.min_trade_amount_usdt,
             get_balance_fn=get_balance_fn,
             place_order_fn=place_order_fn,
+            telegram_queue=self._telegram_queue,
             metrics=self._metrics,
         )
 
@@ -710,6 +711,7 @@ class TradingBot:
             await original_handle_exit(signal)
 
             # Check if position was closed (notification sent by RealOrderExecutor)
+            # Token disabling handled in ExecutionEngine._handle_exit
             if signal.symbol not in self._execution_engine._open_positions and position:
                 exit_value = position.entry_amount * signal.price
                 profit_usdt = exit_value - position.entry_value_usdt
@@ -718,16 +720,6 @@ class TradingBot:
                 coin = signal.symbol.replace("USDT", "").replace("USDC", "")
                 profit_sign = "+" if profit_pct >= 0 else ""
                 self._trading_log.info("EXIT EXECUTED: {} @ {} | P&L: {}{:.2f}%", coin, signal.price, profit_sign, profit_pct)
-
-                # Disable token if loss exceeds threshold (> 1%)
-                if profit_pct < self._execution_engine._disable_loss_threshold_pct:
-                    self._execution_engine.disable_token(signal.symbol, profit_pct)
-                    await self._notify(
-                        f"⛔ <b>Токен {coin} отключён</b>\n"
-                        f"Причина: убыток {profit_pct:.2f}%\n"
-                        f"До следующего обновления токенов",
-                        notify_type="trade"
-                    )
 
                 # Update user deposits based on trade profit (proportional to share)
                 if self._telegram_bot and self._db:
@@ -818,11 +810,8 @@ class TradingBot:
                 # Run sync
                 logger.info("Starting scheduled token sync...")
 
-                # Clear disabled tokens - give them another chance
-                if self._execution_engine:
-                    cleared = self._execution_engine.clear_disabled_tokens()
-                    if cleared > 0:
-                        logger.info("Cleared {} disabled tokens during sync", cleared)
+                # Note: BigLoss tokens are automatically re-enabled during sync
+                # when sync_tokens_to_database() re-evaluates all tokens
 
                 if self._token_sync_service and self._repository:
                     try:

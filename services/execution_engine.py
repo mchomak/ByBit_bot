@@ -60,6 +60,7 @@ class ExecutionEngine:
         min_trade_usdt: float = 10.0,
         get_balance_fn: Optional[Callable[[], float]] = None,
         place_order_fn: Optional[Callable[[str, str, float, float], Dict[str, Any]]] = None,
+        telegram_queue: Optional[asyncio.Queue] = None,
         metrics: Optional[PipelineMetrics] = None,
         logger: Optional[logging.Logger] = None,
     ) -> None:
@@ -78,6 +79,7 @@ class ExecutionEngine:
             min_trade_usdt: Minimum trade size in USDT
             get_balance_fn: Async function to get available USDT balance
             place_order_fn: Async function to place orders
+            telegram_queue: Optional queue for Telegram notifications
             metrics: Optional shared metrics object
             logger: Optional logger instance
         """
@@ -87,6 +89,7 @@ class ExecutionEngine:
         self._order_model = order_model
         self._signal_model = signal_model
         self._strategy_engine = strategy_engine
+        self._telegram_queue = telegram_queue
 
         self._max_positions = int(max_positions)
         self._risk_pct = float(risk_per_trade_pct) / 100.0
@@ -510,6 +513,10 @@ class ExecutionEngine:
                     symbol, order_result.get("failed_qty", 0),
                     order_result.get("errors", [])
                 )
+
+            # Check if loss exceeds threshold - disable token for trading
+            if profit_pct < self._disable_loss_threshold_pct:
+                await self.disable_token_for_loss(symbol, profit_pct)
         else:
             # Track failure
             error_msg = order_result.get("error", "Order failed")
@@ -860,8 +867,34 @@ class ExecutionEngine:
                 "Will be re-enabled on next daily sync.",
                 symbol, loss_pct, self._disable_loss_threshold_pct
             )
+
+            # Send Telegram notification
+            await self._send_token_disabled_notification(symbol, loss_pct)
+
             return True
 
         except Exception as e:
             self._log.exception("Failed to disable token %s: %s", symbol, e)
             return False
+
+    async def _send_token_disabled_notification(
+        self, symbol: str, loss_pct: float
+    ) -> None:
+        """Send Telegram notification when a token is disabled due to loss."""
+        if not self._telegram_queue:
+            return
+
+        try:
+            coin = symbol.replace("USDT", "").replace("USDC", "")
+            msg = (
+                f"<b>⛔ Токен отключён</b>\n\n"
+                f"Монета: {coin}\n"
+                f"Причина: убыток {loss_pct:.1f}%\n"
+                f"Порог: {self._disable_loss_threshold_pct:.1f}%\n\n"
+                f"<i>Токен вернётся в торговлю при следующей синхронизации (каждые 6ч)</i>"
+            )
+            self._telegram_queue.put_nowait({"text": msg, "parse_mode": "HTML"})
+        except asyncio.QueueFull:
+            self._log.warning("Telegram queue full, token disabled notification dropped")
+        except Exception as e:
+            self._log.error("Failed to send token disabled notification: %s", e)
