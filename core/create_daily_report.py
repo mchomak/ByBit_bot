@@ -254,17 +254,33 @@ class DailyReportService:
         end_dt: datetime
     ) -> dict:
         """Get profit statistics from closed positions."""
+        # Debug: check all closed positions without date filter
+        all_closed_result = await session.execute(
+            select(Position).where(Position.status == PositionStatus.CLOSED.value)
+        )
+        all_closed = all_closed_result.scalars().all()
+        self._log.debug(
+            "Total closed positions in DB: {}, exit_times: {}",
+            len(all_closed),
+            [(p.symbol, p.exit_time) for p in all_closed[:5]]  # Show first 5
+        )
+
         # Closed positions in the period
         result = await session.execute(
             select(Position).where(
                 and_(
                     Position.exit_time >= start_dt,
                     Position.exit_time < end_dt,
-                    Position.status == PositionStatus.CLOSED
+                    Position.status == PositionStatus.CLOSED.value
                 )
             )
         )
         closed_positions = result.scalars().all()
+
+        self._log.debug(
+            "Closed positions in range {} to {}: {}",
+            start_dt, end_dt, len(closed_positions)
+        )
 
         total_profit_usdt = 0.0
         total_profit_pct = 0.0
