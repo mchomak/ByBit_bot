@@ -298,6 +298,15 @@ class ExecutionEngine:
             await self._update_signal_execution(signal, False, "Duplicate entry this minute")
             return
 
+        # Gate check 5: Price must be above MA14 for entry
+        if signal.ma14_value is not None and signal.price <= signal.ma14_value:
+            self._log.info(
+                "Skipping entry for %s: price %.6f <= MA14 %.6f",
+                symbol, signal.price, signal.ma14_value
+            )
+            await self._update_signal_execution(signal, False, "Price below MA14")
+            return
+
         # Calculate position size
         balance = await self._get_available_balance()
         position_usdt = balance * self._risk_pct
