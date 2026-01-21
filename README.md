@@ -47,7 +47,7 @@ flowchart LR
 |--------|-----------|--------------|
 | **Market Cap** | ≥ $100M USD | Daily sync |
 | **Blacklist** | Manual exclusion list | Daily sync |
-| **ST Tokens** | Bybit stTag/innovation flags | Daily sync |
+| **ST Tokens** | Bybit stTag/innovation flags (auto-blacklisted) | Daily sync |
 | **LowVolume** | 24h volume ≥ $700k | Daily sync |
 | **StalePrice** | <80% flat candles AND <3 consecutive flat | Every 50 min |
 | **BigLoss** | Trading loss > 1% | On position close |
@@ -57,7 +57,7 @@ flowchart LR
 | Reason | Description | Recovery |
 |--------|-------------|----------|
 | `Blacklist` | Manual blacklist | Never (manual removal) |
-| `ST` | High-risk token | Never (Bybit designation) |
+| `ST` | High-risk token (auto-added to blacklist) | Never (permanent) |
 | `LowMcap` | Market cap < $100M | When mcap increases |
 | `LowVolume` | 24h volume < $700k | Next daily sync |
 | `StalePrice` | Inactive price movement | Next 50-min check |
@@ -70,6 +70,7 @@ flowchart LR
 ### 1. TokenSyncService
 - Syncs tokens from CoinPaprika + Bybit every 6 hours
 - Applies 5 main filters (Market Cap, Blacklist, ST, Volume, Bybit availability)
+- **Auto-blacklists ST tokens**: ST tokens are automatically added to permanent blacklist
 - Updates both `all_tokens` and `tokens` tables
 
 ### 2. StalePriceChecker
