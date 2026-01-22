@@ -213,6 +213,25 @@ async def sync_tokens_to_database(
             if st_tokens:
                 log.info("Found %d ST tokens on Bybit: %s", len(st_tokens), sorted(st_tokens)[:20])
 
+                # Auto-add ST tokens to permanent blacklist
+                new_blacklisted = 0
+                for st_symbol in st_tokens:
+                    if st_symbol.upper() not in blacklisted_symbols:
+                        await repository.enqueue_upsert(
+                            model=BlacklistedToken,
+                            conflict_keys={"symbol": st_symbol.upper()},
+                            update_values={
+                                "bybit_symbol": f"{st_symbol.upper()}USDT",
+                                "reason": "ST (auto-detected high-risk token)",
+                                "added_by": "system",
+                            }
+                        )
+                        blacklisted_symbols.add(st_symbol.upper())
+                        new_blacklisted += 1
+
+                if new_blacklisted > 0:
+                    log.info("Added %d new ST tokens to permanent blacklist", new_blacklisted)
+
         # Get 24h volumes for volume filtering
         log.info("Fetching 24h trading volumes...")
         volumes_24h: Dict[str, float] = {}
