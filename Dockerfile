@@ -1,38 +1,49 @@
-# Bybit Trading Bot Dockerfile
+# ==============================================================================
+# Bybit Trading Bot - Production Dockerfile
+# ==============================================================================
 FROM python:3.12-slim
 
+LABEL maintainer="ByBit Bot Team"
+LABEL description="Automated trading bot for Bybit exchange"
+LABEL version="1.0.0"
+
+# Set working directory
 WORKDIR /app
 
-# Set environment variables
+# Environment variables for Python
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
     curl \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
 
-# Copy requirements first for caching
+# Copy requirements first (for Docker layer caching)
 COPY requirements.txt .
+
+# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
-COPY . .
+COPY config/ ./config/
+COPY core/ ./core/
+COPY db/ ./db/
+COPY services/ ./services/
+COPY bot/ ./bot/
+COPY trade/ ./trade/
 
-# Create non-root user
-RUN useradd -m -u 1000 appuser && \
-    chown -R appuser:appuser /app
-USER appuser
+# Create directories for logs and data
+RUN mkdir -p /app/logs /app/data
 
-# Create log directory
-RUN mkdir -p /app/logs
+# Create non-root user for security
+RUN useradd -m -u 1000 -s /bin/bash botuser && \
+    chown -R botuser:botuser /app
+USER botuser
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "import asyncio; asyncio.run(__import__('httpx').AsyncClient().get('http://localhost:8080/health'))" || exit 1
-
-# Run the bot
-CMD ["python", "-m", "src.main"]
+# Default command - run the bot
+CMD ["python", "-m", "core.main"]
