@@ -155,11 +155,13 @@ async def sync_tokens_to_database(
     """
     Синхронизирует токены в БД (daily sync).
 
+    ВАЖНО: Начинаем с Bybit (источник правды для торговли), затем проверяем mcap через CoinPaprika.
+
     Applies 5 main filters (NOT StalePrice - that's separate):
-    1) Market cap threshold
-    2) Blacklist
-    3) ST (Special Treatment / high-risk)
-    4) Available on Bybit
+    1) Available on Bybit (USDT pairs in Trading status)
+    2) Market cap threshold (via CoinPaprika if available)
+    3) Blacklist
+    4) ST (Special Treatment / high-risk)
     5) 24h volume >= threshold
 
     Two-table structure:
@@ -193,19 +195,53 @@ async def sync_tokens_to_database(
         log.info(f"Loaded {len(blacklisted_symbols)} blacklisted tokens: {sorted(blacklisted_symbols)}")
 
     async with CoinPaprikaClient(logger=log) as paprika, BybitClient(logger=log) as bybit:
-        log.info("Fetching CoinPaprika tickers...")
+        # ============================================================
+        # 1. START FROM BYBIT - get all USDT trading pairs
+        # ============================================================
+        log.info("Fetching Bybit USDT trading pairs for categories: %s", bybit_categories)
+
+        # Collect all Bybit USDT tokens with their categories
+        bybit_tokens: Dict[str, Dict[str, Any]] = {}  # baseCoin -> {categories, bybit_symbol}
+        for cat in bybit_categories:
+            async for inst in bybit.iter_instruments(category=cat, status="Trading"):
+                if inst.quote_coin.upper() != "USDT":
+                    continue
+                base = inst.base_coin.upper()
+                if base not in bybit_tokens:
+                    bybit_tokens[base] = {
+                        "categories": set(),
+                        "bybit_symbol": inst.symbol,
+                    }
+                bybit_tokens[base]["categories"].add(cat)
+
+        log.info("Found %d USDT trading pairs on Bybit", len(bybit_tokens))
+
+        # ============================================================
+        # 2. Get CoinPaprika data for market cap filtering
+        # ============================================================
+        log.info("Fetching CoinPaprika tickers for market cap data...")
         tickers = await paprika.get_tickers()
 
-        candidates = [
-            t for t in tickers
-            if t.market_cap_usd >= market_cap_threshold_usd
-        ]
-        log.info("CoinPaprika candidates with mcap>=%.0f: %d", market_cap_threshold_usd, len(candidates))
+        # Build symbol -> mcap mapping (apply aliases in reverse too)
+        paprika_mcap: Dict[str, float] = {}
+        paprika_names: Dict[str, str] = {}
+        reverse_aliases = {v: k for k, v in aliases.items()}
 
-        log.info("Fetching Bybit instruments baseCoin universe for categories: %s", bybit_categories)
-        base_map = await bybit.get_base_coin_map(categories=bybit_categories)
+        for t in tickers:
+            symbol = t.symbol.upper()
+            paprika_mcap[symbol] = t.market_cap_usd
+            paprika_names[symbol] = t.name
+            # Also check if this symbol is an alias target
+            if symbol in reverse_aliases:
+                orig = reverse_aliases[symbol].upper()
+                paprika_mcap[orig] = t.market_cap_usd
+                paprika_names[orig] = t.name
 
-        # Get ST (Special Treatment) tokens if filtering enabled
+        log.info("CoinPaprika has %d tickers with market cap data", len(paprika_mcap))
+
+        # ============================================================
+        # 3. Get ST (Special Treatment) tokens
+        # ============================================================
         st_tokens: Set[str] = set()
         if filter_st_tokens:
             log.info("Checking for ST (Special Treatment / high-risk) tokens...")
@@ -232,7 +268,9 @@ async def sync_tokens_to_database(
                 if new_blacklisted > 0:
                     log.info("Added %d new ST tokens to permanent blacklist", new_blacklisted)
 
-        # Get 24h volumes for volume filtering
+        # ============================================================
+        # 4. Get 24h volumes for volume filtering
+        # ============================================================
         log.info("Fetching 24h trading volumes...")
         volumes_24h: Dict[str, float] = {}
         for cat in bybit_categories:
@@ -240,44 +278,56 @@ async def sync_tokens_to_database(
             volumes_24h.update(cat_volumes)
         log.info("Fetched 24h volumes for %d symbols", len(volumes_24h))
 
-        # Collect ALL tokens for all_tokens table
+        # ============================================================
+        # 5. Process each Bybit token and apply filters
+        # ============================================================
         all_tokens_data: List[Dict[str, Any]] = []
-        # Collect only active tokens for tokens table
         active_tokens_data: List[Dict[str, Any]] = []
 
         blacklisted_count = 0
         st_filtered_count = 0
         low_volume_count = 0
+        low_mcap_count = 0
+        no_mcap_count = 0
 
-        for t in candidates:
-            normalized_symbol = _apply_symbol_aliases(t.symbol, aliases)
-            bybit_cats: Set[str] = base_map.get(normalized_symbol, set())
+        for base_coin, info in bybit_tokens.items():
+            # Apply symbol aliases
+            normalized_symbol = _apply_symbol_aliases(base_coin, aliases)
+            bybit_symbol = info["bybit_symbol"]
+            categories_str = ",".join(sorted(info["categories"]))
 
-            if not bybit_cats:
-                continue  # Not on Bybit - skip entirely
-
-            bybit_symbol = f"{normalized_symbol}USDT"
-            categories_str = ",".join(sorted(bybit_cats))
+            # Get market cap from CoinPaprika
+            mcap = paprika_mcap.get(normalized_symbol.upper(), 0)
+            name = paprika_names.get(normalized_symbol.upper(), normalized_symbol)
 
             token_data = {
                 "symbol": normalized_symbol,
                 "bybit_symbol": bybit_symbol,
-                "name": t.name,
-                "market_cap_usd": int(t.market_cap_usd),
+                "name": name,
+                "market_cap_usd": int(mcap),
                 "bybit_categories": categories_str,
             }
 
-            # Determine deactivation reason (if any)
+            # Determine deactivation reason (priority order)
             deactivation_reason = None
 
+            # Filter 1: Blacklist (highest priority)
             if normalized_symbol.upper() in blacklisted_symbols:
                 deactivation_reason = "Blacklist"
                 blacklisted_count += 1
+            # Filter 2: ST tokens
             elif normalized_symbol.upper() in st_tokens:
                 deactivation_reason = "ST"
                 st_filtered_count += 1
+            # Filter 3: Market cap (skip if not on CoinPaprika)
+            elif mcap == 0:
+                deactivation_reason = "NoMcapData"
+                no_mcap_count += 1
+            elif mcap < market_cap_threshold_usd:
+                deactivation_reason = "LowMcap"
+                low_mcap_count += 1
+            # Filter 4: Volume
             else:
-                # Check 24h volume (only if not already filtered)
                 volume_24h = volumes_24h.get(bybit_symbol, 0)
                 if volume_24h < volume_threshold_usd:
                     deactivation_reason = "LowVolume"
@@ -298,6 +348,10 @@ async def sync_tokens_to_database(
             log.info(f"Filtered {blacklisted_count} blacklisted tokens")
         if st_filtered_count > 0:
             log.info(f"Filtered {st_filtered_count} ST (high-risk) tokens from candidates")
+        if no_mcap_count > 0:
+            log.info(f"Filtered {no_mcap_count} tokens with no market cap data on CoinPaprika")
+        if low_mcap_count > 0:
+            log.info(f"Filtered {low_mcap_count} tokens with market cap < ${market_cap_threshold_usd:,.0f}")
         if low_volume_count > 0:
             log.info(f"Filtered {low_volume_count} tokens with 24h volume < ${volume_threshold_usd:,.0f}")
 
@@ -378,10 +432,12 @@ async def sync_tokens_to_database(
         await repository._write_queue.join()
 
         log.info(
-            f"Token sync completed: {len(all_tokens_data)} total, "
+            f"Token sync completed: {len(all_tokens_data)} total on Bybit, "
             f"{len(active_tokens_data)} tradable, "
             f"{blacklisted_count} blacklisted, "
             f"{st_filtered_count} ST, "
+            f"{no_mcap_count} no mcap data, "
+            f"{low_mcap_count} low mcap, "
             f"{low_volume_count} low volume"
         )
 

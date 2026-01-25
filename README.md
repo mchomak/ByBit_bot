@@ -58,6 +58,7 @@ flowchart LR
 |--------|-------------|----------|
 | `Blacklist` | Manual blacklist | Never (manual removal) |
 | `ST` | High-risk token (auto-added to blacklist) | Never (permanent) |
+| `NoMcapData` | Token not found on CoinPaprika | When listed on CoinPaprika |
 | `LowMcap` | Market cap < $100M | When mcap increases |
 | `LowVolume` | 24h volume < $700k | Next daily sync |
 | `StalePrice` | Inactive price movement | Next 50-min check |
@@ -68,8 +69,9 @@ flowchart LR
 ## Services
 
 ### 1. TokenSyncService
-- Syncs tokens from CoinPaprika + Bybit every 6 hours
-- Applies 5 main filters (Market Cap, Blacklist, ST, Volume, Bybit availability)
+- **Starts from Bybit** (source of truth for tradeable tokens)
+- Gets market cap data from CoinPaprika for filtering
+- Applies 5 main filters (Blacklist, ST, NoMcapData, LowMcap, LowVolume)
 - **Auto-blacklists ST tokens**: ST tokens are automatically added to permanent blacklist
 - Updates both `all_tokens` and `tokens` tables
 
