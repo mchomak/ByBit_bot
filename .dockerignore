@@ -1,30 +1,43 @@
-# VCS и IDE
+# VCS and IDE
 .git
 .gitignore
 .vscode/
 .idea/
+.DS_Store
 
-# Python артефакты
+# Python artifacts
 __pycache__/
 *.py[cod]
 *.pyd
 *.pyo
 *.egg-info/
-.dist/
 build/
 dist/
 
-# Виртуальные окружения
+# Virtual environments
 .venv/
 venv/
 
-# Логи, временные и большие данные (подстрой под себя)
+# Logs and data
 logs/
 tmp/
 data/
-*.env
-bt_test_47_fold1/
-tools/
+*.log
 
-# Если попутно есть Node/TS
-node_modules/
+# Environment files (secrets)
+.env
+*.env.local
+
+# Test files
+test/
+Test_*.py
+*_test.py
+
+# Documentation (except README)
+*.md
+!README.md
+
+# Docker files (not needed inside container)
+Dockerfile
+docker-compose.yml
+.dockerignore

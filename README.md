@@ -1,360 +1,494 @@
-# Bybit Trading Bot
+# Bybit Trading Bot v1.0.0
 
-Autonomous trading bot for Bybit Spot market that monitors 300+ coins 24/7, detects impulse movements (abnormal volume + price acceleration), and executes trades with automatic position management.
+Автоматизированный торговый бот для биржи Bybit. Мониторит 300+ монет 24/7, обнаруживает импульсные движения (аномальный объём + ценовое ускорение) и исполняет сделки с автоматическим управлением позициями.
 
-> **Disclaimer**: This project is provided for educational purposes. Trading crypto assets is risky. Use testnet mode and trade at your own risk.
+> **Disclaimer**: Торговля криптовалютами сопряжена с высоким риском. Используйте Demo режим для тестирования. Авторы не несут ответственности за финансовые потери.
 
 ---
 
-## Architecture
+## Содержание
 
-The bot is built as an event-driven pipeline:
+- [Возможности](#возможности)
+- [Архитектура](#архитектура)
+- [Быстрый старт](#быстрый-старт)
+  - [Вариант 1: Запуск через Python](#вариант-1-запуск-через-python)
+  - [Вариант 2: Запуск через Docker](#вариант-2-запуск-через-docker)
+- [Конфигурация](#конфигурация)
+- [Получение API ключей](#получение-api-ключей)
+- [Фильтрация токенов](#фильтрация-токенов)
+- [Торговая стратегия](#торговая-стратегия)
+- [Структура проекта](#структура-проекта)
+- [Мониторинг и логи](#мониторинг-и-логи)
+- [Troubleshooting](#troubleshooting)
+
+---
+
+## Возможности
+
+- Автоматическая торговля на спотовом рынке Bybit
+- 7 уровней фильтрации токенов (капитализация, объём, риски и др.)
+- Уведомления в Telegram (сделки, ошибки, ежедневные отчёты)
+- Поддержка Demo и Production режимов
+- Защита от торговли "мёртвыми" токенами (StalePrice)
+- Автоматическое отключение убыточных токенов (BigLoss)
+- Синхронизация серверного времени Bybit
+
+---
+
+## Архитектура
 
 ```
-Data Collection → Token Filtering → Signal Detection → Execution → Position Management
+┌─────────────────────────────────────────────────────────────────┐
+│                         BYBIT API                               │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐  │
+│  │  REST API    │  │  WebSocket   │  │  Trading API         │  │
+│  │  (данные)    │  │  (real-time) │  │  (ордера, баланс)    │  │
+│  └──────┬───────┘  └──────┬───────┘  └──────────┬───────────┘  │
+└─────────┼─────────────────┼─────────────────────┼──────────────┘
+          │                 │                     │
+          ▼                 ▼                     ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                      TRADING BOT                                │
+│                                                                 │
+│  ┌─────────────────┐    ┌─────────────────┐    ┌─────────────┐ │
+│  │ Token Sync      │    │ Market Data     │    │ Execution   │ │
+│  │ Service         │───▶│ Service         │───▶│ Engine      │ │
+│  │ (Bybit+Paprika) │    │ (WS Klines)     │    │ (Orders)    │ │
+│  └─────────────────┘    └─────────────────┘    └─────────────┘ │
+│          │                      │                     │         │
+│          ▼                      ▼                     ▼         │
+│  ┌─────────────────────────────────────────────────────────────┐│
+│  │                    PostgreSQL Database                      ││
+│  │  ┌──────────┐ ┌────────────┐ ┌─────────┐ ┌───────────────┐ ││
+│  │  │  tokens  │ │ all_tokens │ │ candles │ │   positions   │ ││
+│  │  └──────────┘ └────────────┘ └─────────┘ └───────────────┘ ││
+│  └─────────────────────────────────────────────────────────────┘│
+│                              │                                  │
+│                              ▼                                  │
+│                    ┌─────────────────┐                         │
+│                    │    Telegram     │                         │
+│                    │    Notifier     │                         │
+│                    └─────────────────┘                         │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-```mermaid
-flowchart LR
-    A[CoinPaprika] -->|market cap filter| B[TokenSyncService]
-    C[Bybit API] -->|spot pairs + ST tokens| B
-    B -->|5 filters| D[(all_tokens + tokens)]
-    D --> E[BybitMarketDataService]
-    E -->|WebSocket 1m klines| F[(MarketDataQueue)]
-    F --> G[StrategyService]
-    G -->|entry/exit signals| H[(SignalQueue)]
-    H --> I[ExecutionEngine]
-    I -->|orders| J[Bybit REST API]
-    G & I -->|notifications| K[(TelegramQueue)]
-    K --> L[TelegramService]
-    M[StalePriceChecker] -->|every 50 min| D
-```
+---
+
+## Быстрый старт
+
+### Требования
+
+- **Python**: 3.11+ (рекомендуется 3.12)
+- **PostgreSQL**: 14+
+- **Bybit API**: Demo или Production ключи
+- **Telegram Bot** (опционально): для уведомлений
 
 ---
 
-## Token Filtering System
+### Вариант 1: Запуск через Python
 
-### Two-Table Architecture
+#### Шаг 1: Клонирование репозитория
 
-| Table | Purpose |
-|-------|---------|
-| `all_tokens` | Complete list with deactivation reasons |
-| `tokens` | Only tradeable tokens (passed all filters) |
-
-### 6 Filters Applied
-
-| Filter | Condition | When Checked |
-|--------|-----------|--------------|
-| **Market Cap** | ≥ $100M USD | Daily sync |
-| **Blacklist** | Manual exclusion list | Daily sync |
-| **ST Tokens** | Bybit stTag/innovation flags (auto-blacklisted) | Daily sync |
-| **LowVolume** | 24h volume ≥ $700k | Daily sync |
-| **StalePrice** | <80% flat candles AND <3 consecutive flat | Every 50 min |
-| **BigLoss** | Trading loss > 1% | On position close |
-
-### Deactivation Reasons in `all_tokens`
-
-| Reason | Description | Recovery |
-|--------|-------------|----------|
-| `Blacklist` | Manual blacklist | Never (manual removal) |
-| `ST` | High-risk token (auto-added to blacklist) | Never (permanent) |
-| `NoMcapData` | Token not found on CoinPaprika | When listed on CoinPaprika |
-| `LowMcap` | Market cap < $100M | When mcap increases |
-| `LowVolume` | 24h volume < $700k | Next daily sync |
-| `StalePrice` | Inactive price movement | Next 50-min check |
-| `BigLoss` | Loss > 1% on trade | Next daily sync (6h) |
-
----
-
-## Services
-
-### 1. TokenSyncService
-- **Starts from Bybit** (source of truth for tradeable tokens)
-- Gets market cap data from CoinPaprika for filtering
-- Applies 5 main filters (Blacklist, ST, NoMcapData, LowMcap, LowVolume)
-- **Auto-blacklists ST tokens**: ST tokens are automatically added to permanent blacklist
-- Updates both `all_tokens` and `tokens` tables
-
-### 2. StalePriceChecker
-- Runs every 50 minutes
-- **Hybrid detection algorithm**:
-  - ≥80% of candles are flat (open == close) **OR**
-  - ≥3 consecutive flat candles
-- Toggles `is_active` in `tokens` table
-
-### 3. BybitMarketDataService
-- REST: Fetches historical candles for bootstrap
-- WebSocket: Real-time 1-minute klines
-- Server time synchronization (handles clock drift)
-
-### 4. StrategyService
-- **Entry signals**: Volume spike + price acceleration + price > MA14
-- **Exit signals**: Price crosses below MA14
-
-### 5. ExecutionEngine
-6 gate checks before entry:
-1. Token active in database
-2. No existing position for symbol
-3. Max positions not reached
-4. No duplicate entry this minute
-5. **Price > MA14** (new)
-6. Position size ≥ minimum
-
-On position close with loss > 1%:
-- Removes token from `tokens`
-- Marks in `all_tokens` as `BigLoss`
-- Sends Telegram notification
-
-### 6. TelegramService
-- Trade notifications (buy/sell)
-- Error alerts
-- Daily reports at 00:00
-- Token disabled notifications
-
-### 7. DailyReportService
-- Runs at 00:00 (configurable timezone)
-- Reports: orders count, P&L, win rate, active tokens
-
----
-
-## Quick Start
-
-### Prerequisites
-
-- Python 3.12+
-- PostgreSQL 16+
-- Bybit API keys
-- Telegram bot token
-
-### Installation
-
-1. Clone the repository:
 ```bash
-git clone <repo-url>
+git clone https://github.com/your-repo/ByBit_bot.git
 cd ByBit_bot
 ```
 
-2. Create virtual environment:
+#### Шаг 2: Создание виртуального окружения
+
 ```bash
+# Создание
 python -m venv venv
-source venv/bin/activate  # Linux/Mac
-# or: venv\Scripts\activate  # Windows
+
+# Активация (Linux/macOS)
+source venv/bin/activate
+
+# Активация (Windows)
+venv\Scripts\activate
 ```
 
-3. Install dependencies:
+#### Шаг 3: Установка зависимостей
+
 ```bash
 pip install -r requirements.txt
 ```
 
-4. Configure environment:
+#### Шаг 4: Настройка PostgreSQL
+
 ```bash
-cp .env.example .env
-# Edit .env with your API keys and settings
+# Создание базы данных (Linux/macOS)
+sudo -u postgres psql -c "CREATE DATABASE bybit_bot;"
+sudo -u postgres psql -c "CREATE USER botuser WITH PASSWORD 'botpass';"
+sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE bybit_bot TO botuser;"
+sudo -u postgres psql -c "ALTER DATABASE bybit_bot OWNER TO botuser;"
+
+# Windows (PowerShell от имени администратора)
+psql -U postgres -c "CREATE DATABASE bybit_bot;"
+psql -U postgres -c "CREATE USER botuser WITH PASSWORD 'botpass';"
+psql -U postgres -c "GRANT ALL PRIVILEGES ON DATABASE bybit_bot TO botuser;"
 ```
 
-5. Run the bot:
+#### Шаг 5: Конфигурация
+
+```bash
+# Копируем пример конфигурации
+cp .env.example .env
+
+# Редактируем файл (используйте любой редактор)
+nano .env
+```
+
+**Минимальная конфигурация `.env`:**
+
+```env
+# === База данных ===
+DATABASE_URL=postgresql+asyncpg://botuser:botpass@localhost:5432/bybit_bot
+
+# === Bybit API (Demo режим) ===
+DEMO=true
+BYBIT_DEMO_API_KEY=ваш_demo_api_key
+BYBIT_DEMO_API_SECRET=ваш_demo_api_secret
+
+# === Telegram (опционально) ===
+TELEGRAM_BOT_TOKEN=ваш_telegram_bot_token
+TELEGRAM_CHAT_ID=ваш_chat_id
+
+# === Режим работы ===
+DRY_RUN=true
+# true = симуляция (ордера НЕ отправляются)
+# false = реальные ордера
+```
+
+#### Шаг 6: Запуск бота
+
 ```bash
 python -m core.main
 ```
 
-### Docker Deployment
+**Ожидаемый вывод при успешном запуске:**
 
-```bash
-# Start with docker-compose (includes PostgreSQL)
-docker-compose up -d
-
-# View logs
-docker-compose logs -f bot
+```
+INFO     | Bot starting in TESTNET mode
+INFO     | Database connection established
+INFO     | Fetching Bybit USDT trading pairs...
+INFO     | Found 450 USDT trading pairs on Bybit
+INFO     | Token sync completed: 450 total, 127 tradable
+INFO     | WebSocket connected to stream.bybit.com
+INFO     | Bot is running. Press Ctrl+C to stop.
 ```
 
 ---
 
-## Configuration
+### Вариант 2: Запуск через Docker
 
-All settings are in `.env` file. Key parameters:
+#### Шаг 1: Установка Docker
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `BYBIT_API_KEY` | Bybit API key | - |
-| `BYBIT_API_SECRET` | Bybit API secret | - |
-| `BYBIT_DEMO` | Use demo/testnet | false |
-| `TELEGRAM_BOT_TOKEN` | Telegram bot token | - |
-| `MIN_MARKET_CAP_USD` | Minimum market cap | 100,000,000 |
-| `MIN_VOLUME_24H_USD` | Minimum 24h volume | 700,000 |
-| `VOLUME_SPIKE_MULTIPLIER` | Volume threshold | 1.5 |
-| `MIN_PRICE_CHANGE_PCT` | Min price change % | 1.0 |
-| `MA_EXIT_PERIOD` | MA period for exit | 14 |
-| `MAX_POSITIONS` | Max simultaneous positions | 5 |
-| `RISK_PER_TRADE_PCT` | Balance % per trade | 5.0 |
-| `STALE_CHECK_INTERVAL_MIN` | Stale price check interval | 50 |
-| `TOKEN_SYNC_TIME` | Daily sync time (HH:MM) | 06:00 |
+- **Linux**: https://docs.docker.com/engine/install/
+- **macOS/Windows**: https://www.docker.com/products/docker-desktop
+
+#### Шаг 2: Клонирование и настройка
+
+```bash
+git clone https://github.com/your-repo/ByBit_bot.git
+cd ByBit_bot
+
+# Копируем конфигурацию
+cp .env.example .env
+nano .env
+```
+
+**Конфигурация `.env` для Docker:**
+
+```env
+# === PostgreSQL (для docker-compose) ===
+POSTGRES_USER=botuser
+POSTGRES_PASSWORD=botpass
+POSTGRES_DB=bybit_bot
+
+# === Bybit API ===
+DEMO=true
+BYBIT_DEMO_API_KEY=ваш_demo_api_key
+BYBIT_DEMO_API_SECRET=ваш_demo_api_secret
+
+# === Telegram ===
+TELEGRAM_BOT_TOKEN=ваш_telegram_bot_token
+TELEGRAM_CHAT_ID=ваш_chat_id
+
+# === Режим работы ===
+DRY_RUN=true
+```
+
+#### Шаг 3: Сборка и запуск
+
+```bash
+# Сборка образа и запуск контейнеров
+docker-compose up -d --build
+
+# Проверка статуса
+docker-compose ps
+```
+
+**Ожидаемый вывод:**
+
+```
+NAME              STATUS                   PORTS
+bybit_bot         Up 2 minutes
+bybit_bot_db      Up 2 minutes (healthy)   5432/tcp
+```
+
+#### Шаг 4: Просмотр логов
+
+```bash
+# Логи бота в реальном времени
+docker-compose logs -f bot
+
+# Логи базы данных
+docker-compose logs -f db
+```
+
+#### Полезные команды Docker
+
+```bash
+# Остановка
+docker-compose down
+
+# Перезапуск бота
+docker-compose restart bot
+
+# Вход в контейнер бота
+docker-compose exec bot bash
+
+# Подключение к базе данных
+docker-compose exec db psql -U botuser -d bybit_bot
+
+# Полная очистка (включая данные БД!)
+docker-compose down -v
+```
 
 ---
 
-## Strategy
+## Конфигурация
 
-### Entry Conditions (ALL must be true)
-1. **Volume Spike**: Current volume > `VOLUME_SPIKE_MULTIPLIER` × baseline
-2. **Price Acceleration**: Price change ≥ `MIN_PRICE_CHANGE_PCT`%
-3. **Price Above MA14**: Current price > 14-period moving average
-4. **Token Active**: Not filtered by any deactivation reason
-5. **Risk Check**: Open positions < `MAX_POSITIONS`
+### Основные параметры
 
-### Exit Conditions
-1. **MA Crossover**: Price crosses below MA14
+| Параметр | По умолчанию | Описание |
+|----------|--------------|----------|
+| `DEMO` | `true` | `true` = Demo аккаунт, `false` = Production |
+| `DRY_RUN` | `true` | `true` = симуляция, `false` = реальные ордера |
+| `RISK_PER_TRADE_PCT` | `5.0` | Процент капитала на одну сделку |
+| `MAX_POSITIONS` | `5` | Максимум одновременно открытых позиций |
+| `STOP_LOSS_PCT` | `7.0` | Стоп-лосс в процентах |
+| `MIN_MARKET_CAP_USD` | `100000000` | Минимальная капитализация ($100M) |
 
-### Risk Management
-- **Position Sizing**: `RISK_PER_TRADE_PCT`% of available balance
-- **BigLoss Protection**: Token disabled after >1% loss (re-enabled next sync)
-- **Stale Price Protection**: Tokens with inactive prices excluded
+### Параметры стратегии
 
----
+| Параметр | По умолчанию | Описание |
+|----------|--------------|----------|
+| `VOLUME_WINDOW_DAYS` | `5` | Период анализа объёма (дней) |
+| `PRICE_ACCELERATION_FACTOR` | `3.0` | Фактор ценового ускорения |
+| `MA_EXIT_PERIOD` | `14` | Период MA для сигнала выхода |
 
-## Telegram Commands
-
-| Command | Description |
-|---------|-------------|
-| `/start` | Register and welcome message |
-| `/status` | Bot status and metrics |
-| `/positions` | List open positions |
-| `/stats` | Trading statistics |
-| `/tokens` | Active tokens count |
-| `/help` | Available commands |
-
-### Notification Types
-
-| Type | Example |
-|------|---------|
-| Entry | 🟢 **Покупка** BTCUSDT @ 42,150.50 |
-| Exit | 🔴 **Продажа** BTCUSDT P&L: +2.5% |
-| Token Disabled | ⛔ Токен отключён: XYZ (убыток -5.5%) |
-| Daily Report | 📊 Ежедневный отчёт |
-| Error | ⚠️ Ошибка торговли |
+Полный список параметров с описаниями: см. файл `.env.example`
 
 ---
 
-## Project Structure
+## Получение API ключей
+
+### Bybit Demo API (для тестирования)
+
+1. Зарегистрируйтесь на [demo.bybit.com](https://demo.bybit.com)
+2. Перейдите: **Account** → **API Management**
+3. Нажмите **Create New Key**
+4. Настройки:
+   - API Key Type: **System-generated**
+   - Permissions: **Read-Write**
+   - Contract: **USDT Perpetual**, **Spot** ✓
+5. Скопируйте **API Key** и **API Secret**
+
+### Bybit Production API (для реальной торговли)
+
+1. Войдите на [bybit.com](https://www.bybit.com)
+2. Перейдите: **Account & Security** → **API Management**
+3. Создайте ключ с правами **Read-Write** и **Spot Trading**
+4. **Рекомендуется**: Ограничьте доступ по IP-адресу
+
+### Telegram Bot Token
+
+1. Откройте [@BotFather](https://t.me/BotFather) в Telegram
+2. Отправьте `/newbot`
+3. Следуйте инструкциям, скопируйте токен
+4. Узнайте Chat ID через [@userinfobot](https://t.me/userinfobot)
+
+---
+
+## Фильтрация токенов
+
+Бот начинает с полного списка токенов Bybit и применяет 7 фильтров:
+
+| # | Фильтр | Условие | Когда |
+|---|--------|---------|-------|
+| 1 | **Bybit** | USDT пара в статусе Trading | При синхронизации |
+| 2 | **Blacklist** | Ручной чёрный список | При синхронизации |
+| 3 | **ST Tokens** | Высокорисковые токены (авто-blacklist) | При синхронизации |
+| 4 | **NoMcapData** | Нет данных о капитализации | При синхронизации |
+| 5 | **LowMcap** | Капитализация < $100M | При синхронизации |
+| 6 | **LowVolume** | 24h объём < $700k | При синхронизации |
+| 7 | **StalePrice** | ≥80% плоских свечей ИЛИ ≥3 подряд | Каждые 50 мин |
+| 8 | **BigLoss** | Убыток > 1% по сделке | При закрытии |
+
+---
+
+## Торговая стратегия
+
+### Условия входа (все должны выполняться)
+
+1. **Volume Spike**: Текущий объём > максимального за 5 дней
+2. **Price Acceleration**: close ≥ open × 3.0
+3. **Price > MA14**: Цена выше 14-периодной скользящей средней
+4. **Token Active**: Токен прошёл все фильтры
+5. **Risk Check**: Открытых позиций < MAX_POSITIONS
+
+### Условия выхода
+
+1. **MA Crossover**: Цена пересекла MA14 сверху вниз
+
+### Управление рисками
+
+- **Position Sizing**: RISK_PER_TRADE_PCT% от доступного баланса
+- **Stop-Loss**: Автоматическое закрытие при падении на STOP_LOSS_PCT%
+- **BigLoss Protection**: Токен отключается после убытка >1%
+- **Stale Price Protection**: Неактивные токены исключаются
+
+---
+
+## Структура проекта
 
 ```
 ByBit_bot/
-├── core/
-│   ├── main.py                 # Entry point & orchestrator
-│   └── create_daily_report.py  # Daily report generation
 ├── config/
-│   └── config.py               # Configuration settings
+│   └── config.py              # Настройки из .env
+├── core/
+│   ├── main.py                # Точка входа
+│   ├── bootstrap_logging.py   # Настройка логирования
+│   └── create_daily_report.py # Ежедневные отчёты
 ├── db/
-│   ├── models.py               # SQLAlchemy models
-│   ├── database.py             # Database connection
-│   └── repository.py           # CRUD operations
+│   ├── database.py            # Подключение к БД
+│   ├── models.py              # SQLAlchemy модели
+│   └── repository.py          # CRUD операции
 ├── services/
-│   ├── bybit_client.py         # Bybit API client
-│   ├── execution_engine.py     # Order execution + BigLoss
-│   ├── strategy_engine.py      # Signal detection
-│   ├── stale_price_checker.py  # Stale price detection
-│   ├── token_sync_service.py   # Token synchronization
-│   ├── paprika_bybit_matcher.py # Token filtering
-│   └── real_order_executor.py  # Order placement
+│   ├── bybit_client.py        # REST + WebSocket клиент
+│   ├── strategy_engine.py     # Торговая стратегия
+│   ├── execution_engine.py    # Исполнение ордеров
+│   ├── paprika_bybit_matcher.py  # Синхронизация токенов
+│   ├── stale_price_checker.py    # Проверка активности цен
+│   └── real_order_executor.py    # Отправка ордеров
+├── bot/
+│   ├── TelegramBot.py         # Telegram уведомления
+│   └── TelegramNotifier.py
 ├── trade/
-│   └── trade_client.py         # Trading API with time sync
-├── requirements.txt
-├── Dockerfile
-├── docker-compose.yml
-├── .env.example
-└── README.md
+│   └── trade_client.py        # Торговый клиент
+├── .env.example               # Пример конфигурации
+├── requirements.txt           # Python зависимости
+├── Dockerfile                 # Docker образ
+└── docker-compose.yml         # Docker Compose
 ```
 
 ---
 
-## Database Schema
+## Мониторинг и логи
 
-### Key Tables
+### Просмотр логов
+
+```bash
+# Python запуск
+tail -f logs/bot.log
+
+# Docker
+docker-compose logs -f bot
+```
+
+### Telegram уведомления
+
+| Тип | Пример |
+|-----|--------|
+| Покупка | 🟢 **Покупка** BTCUSDT @ 42,150.50 |
+| Продажа | 🔴 **Продажа** BTCUSDT P&L: +2.5% |
+| Отключение токена | ⛔ Токен отключён: XYZ (убыток -5.5%) |
+| Ежедневный отчёт | 📊 Ордеров: 15, P&L: +$127.50 |
+
+### SQL запросы для диагностики
 
 ```sql
--- All tokens (full list with reasons)
-all_tokens (
-    symbol, bybit_symbol, name, market_cap_usd,
-    bybit_categories, is_active, deactivation_reason
-)
+-- Проверить статус токена
+SELECT symbol, is_active, deactivation_reason
+FROM all_tokens WHERE symbol = 'BTC';
 
--- Tradeable tokens only
-tokens (
-    symbol, bybit_symbol, name, market_cap_usd,
-    bybit_categories, is_active
-)
+-- Список отключённых токенов
+SELECT symbol, deactivation_reason
+FROM all_tokens WHERE is_active = false;
 
--- Trading positions
-positions (
-    symbol, status, entry_price, entry_amount,
-    exit_price, exit_time, profit_usdt, profit_pct
-)
-
--- Order history
-orders (
-    bybit_order_id, symbol, side, status,
-    quantity, filled_quantity, avg_fill_price
-)
-```
-
----
-
-## Development
-
-### Running Tests
-```bash
-pytest
-pytest test/test_unit.py -v
-pytest test/test_trading_integration.py -v
-```
-
-### Log Files
-- `logs/bot.log` - Main bot log
-- `logs/trading.log` - Trading decisions log
-
-### Adding New Filters
-
-1. Add deactivation reason to `db/models.py` AllToken docstring
-2. Add filter logic in `services/paprika_bybit_matcher.py`
-3. Update counter and logging
-
-### Adding New Gate Checks
-
-Add check in `services/execution_engine.py` `_handle_entry()`:
-```python
-# Gate check N: Your condition
-if your_condition:
-    self._log.info("Skipping entry for %s: reason", symbol)
-    await self._update_signal_execution(signal, False, "Reason")
-    return
+-- Открытые позиции
+SELECT * FROM positions WHERE status = 'OPEN';
 ```
 
 ---
 
 ## Troubleshooting
 
-### Common Issues
+### Ошибка подключения к БД
 
-| Issue | Solution |
-|-------|----------|
-| "Invalid timestamp" errors | Bot auto-syncs server time. Check system clock. |
-| Stale price checker stops | Fixed: uses `.format()` for logging |
-| Token bought after disable | Fixed: DB check before each trade |
-| Daily report shows 0 P&L | Fixed: enum comparison with `.value` |
+```
+sqlalchemy.exc.OperationalError: connection refused
+```
 
-### Checking Token Status
-```sql
--- Check why token is disabled
-SELECT symbol, is_active, deactivation_reason
-FROM all_tokens
-WHERE symbol = 'XYZ';
+**Решение**: Проверьте что PostgreSQL запущен и DATABASE_URL корректен.
 
--- List all disabled tokens
-SELECT symbol, deactivation_reason
-FROM all_tokens
-WHERE is_active = false;
+### Invalid API Key
+
+```
+Bybit API Error: Invalid API key
+```
+
+**Решение**: Убедитесь что используете Demo ключи при `DEMO=true` и Production при `DEMO=false`.
+
+### Invalid timestamp
+
+```
+Bybit API Error: Invalid timestamp
+```
+
+**Решение**: Бот автоматически синхронизирует время. Если ошибка повторяется - проверьте системные часы.
+
+### Docker: Permission denied
+
+```
+PermissionError: [Errno 13] Permission denied: '/app/logs'
+```
+
+**Решение**:
+```bash
+chmod -R 777 logs/
+docker-compose restart bot
 ```
 
 ---
 
-## License
+## Режимы работы
+
+| Режим | DEMO | DRY_RUN | Описание |
+|-------|------|---------|----------|
+| **Тестирование** | `true` | `true` | Симуляция на Demo данных |
+| **Demo торговля** | `true` | `false` | Реальные ордера на Demo бирже |
+| **Production** | `false` | `false` | Реальная торговля |
+
+---
+
+## Лицензия
 
 MIT License
+
+---
+
+## Поддержка
+
+- **Issues**: https://github.com/your-repo/ByBit_bot/issues

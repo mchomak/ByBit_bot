@@ -1,41 +1,52 @@
-# Bybit Trading Bot - Docker Compose Configuration
-version: '3.8'
+version: "3.8"
 
 services:
+  # ==============================================================================
   # PostgreSQL Database
-  postgres:
+  # ==============================================================================
+  db:
     image: postgres:16-alpine
     container_name: bybit_bot_db
+    restart: unless-stopped
     environment:
-      POSTGRES_DB: ${DB_NAME:-bybit_bot}
-      POSTGRES_USER: ${DB_USER:-bot_user}
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-changeme}
+      POSTGRES_USER: ${POSTGRES_USER:-botuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-botpass}
+      POSTGRES_DB: ${POSTGRES_DB:-bybit_bot}
     volumes:
       - postgres_data:/var/lib/postgresql/data
-    ports:
-      - "${DB_PORT:-5432}:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-bot_user} -d ${DB_NAME:-bybit_bot}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-botuser} -d ${POSTGRES_DB:-bybit_bot}"]
       interval: 10s
       timeout: 5s
       retries: 5
-    restart: unless-stopped
+    networks:
+      - bot_network
 
-  # Trading Bot Application
+  # ==============================================================================
+  # Trading Bot
+  # ==============================================================================
   bot:
-    build: .
-    container_name: bybit_trading_bot
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: bybit_bot
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
     env_file:
       - .env
     environment:
-      # Override DATABASE_URL to use Docker network
-      DATABASE_URL: postgresql+asyncpg://${DB_USER:-bot_user}:${DB_PASSWORD:-changeme}@postgres:5432/${DB_NAME:-bybit_bot}
+      # Override DATABASE_URL to use container network
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-botuser}:${POSTGRES_PASSWORD:-botpass}@db:5432/${POSTGRES_DB:-bybit_bot}
     volumes:
       - ./logs:/app/logs
-    depends_on:
-      postgres:
-        condition: service_healthy
-    restart: unless-stopped
+    networks:
+      - bot_network
 
 volumes:
   postgres_data:
+
+networks:
+  bot_network:
+    driver: bridge
