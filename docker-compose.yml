@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   # ==============================================================================
   # PostgreSQL Database
@@ -14,6 +12,8 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-bybit_bot}
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"  # Порт 5433 снаружи → 5432 внутри (чтобы не конфликтовать с локальным PostgreSQL)
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-botuser} -d ${POSTGRES_DB:-bybit_bot}"]
       interval: 10s
