@@ -601,6 +601,7 @@ class TradingBot:
                 order_model=Order,
                 telegram_queue=self._telegram_queue,
                 demo=settings.bybit_demo,
+                dry_run=settings.dry_run,
                 max_concurrent=settings.order_max_concurrent,
                 retry_count=settings.order_retry_count,
                 category=settings.bybit_category,
@@ -611,7 +612,16 @@ class TradingBot:
             place_order_fn = create_place_order_function(self._order_executor)
             get_balance_fn = create_get_balance_function(self._order_executor)
 
-            if settings.bybit_demo:
+            if settings.dry_run:
+                logger.warning("=" * 60)
+                logger.warning("DRY_RUN MODE - Orders will be SIMULATED (not sent to exchange)")
+                logger.warning("=" * 60)
+                await self._notify(
+                    "⚪ <b>DRY_RUN РЕЖИМ</b>\n"
+                    "Ордера НЕ отправляются на биржу (симуляция)",
+                    notify_type="status"
+                )
+            elif settings.bybit_demo:
                 logger.info("=" * 60)
                 logger.info("DEMO MODE - Orders will be placed on Bybit demo")
                 logger.info("=" * 60)

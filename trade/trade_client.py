@@ -635,7 +635,11 @@ class OrderQueue:
         """Исполнить ордер"""
         order.status = OrderStatus.PROCESSING
         logger.info(f"🔄 {order.id}: {order.side.value} {order.qty} {order.symbol}")
-        
+
+        # Generate unique orderLinkId for idempotency (prevents duplicate orders on retry)
+        # Use order.id as base - it's unique for each queued order
+        order_link_id = f"bot_{order.id}_{int(time.time())}"
+
         result = None
         for attempt in range(self.retry_count):
             try:
@@ -645,14 +649,16 @@ class OrderQueue:
                     "side": order.side.value,
                     "orderType": order.order_type.value,
                     "qty": order.qty,
-                    "timeInForce": order.time_in_force.value
+                    "timeInForce": order.time_in_force.value,
+                    "orderLinkId": order_link_id,  # Idempotency key - prevents duplicate orders
                 }
-                
+
                 if order.price:
                     params["price"] = order.price
+                    
                 if order.market_unit:
                     params["marketUnit"] = order.market_unit
-                
+
                 resp = await self._api.request("POST", "/v5/order/create", params)
                 
                 if resp.get("retCode") == 0:

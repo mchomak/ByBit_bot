@@ -145,6 +145,7 @@ class RealOrderExecutorService:
         *,
         telegram_queue: Optional[asyncio.Queue] = None,
         demo: bool = False,
+        dry_run: bool = False,
         max_concurrent: int = 1,
         retry_count: int = 3,
         category: str = "spot",
@@ -159,6 +160,7 @@ class RealOrderExecutorService:
             order_model: Order SQLAlchemy model
             telegram_queue: Optional queue for Telegram notifications
             demo: Use Bybit demo if True
+            dry_run: If True, orders are simulated (logged but not sent to exchange)
             max_concurrent: Maximum concurrent order executions
             retry_count: Number of retries for failed orders
             category: Bybit category (spot, linear, inverse)
@@ -167,6 +169,7 @@ class RealOrderExecutorService:
         self._order_model = order_model
         self._telegram_queue = telegram_queue
         self._category = Category(category)
+        self._dry_run = dry_run
 
         # Initialize OrderQueue from trade_client
         self._order_queue = OrderQueue(
@@ -207,7 +210,13 @@ class RealOrderExecutorService:
         await self._order_queue.start()
         self._running = True
 
-        mode = "TESTNET" if self._order_queue.demo else "MAINNET"
+        if self._dry_run:
+            mode = "DRY_RUN (симуляция)"
+            self._log.warning("=" * 60)
+            self._log.warning("DRY_RUN MODE - Orders will NOT be sent to exchange!")
+            self._log.warning("=" * 60)
+        else:
+            mode = "TESTNET" if self._order_queue.demo else "MAINNET"
         self._log.info("Real order executor started ({} mode)", mode)
 
     async def stop(self) -> None:
@@ -383,9 +392,78 @@ class RealOrderExecutorService:
             Dict with success status and order details
         """
         try:
+            # DRY_RUN: Simulate order without sending to exchange
+            if self._dry_run:
+                self._log.info(
+                    "[DRY_RUN] Simulated {} {} {} @ {} (не отправлен на биржу)",
+                    side, quantity, symbol, price or "MARKET"
+                )
+                # Return simulated success
+                return {
+                    "success": True,
+                    "dry_run": True,
+                    "order_ids": [],
+                    "filled_qty": quantity,
+                    "avg_price": price or 0,
+                    "orders_completed": 1,
+                    "orders_failed": 0,
+                    "message": "DRY_RUN: Order simulated, not sent to exchange",
+                }
+
             # Get qty_step and max_qty for proper truncation and limits
             min_info = await self._order_queue.get_min_order(symbol, self._category)
             qty_step = min_info.get("qty_step", "0.000001")
+
+            # Get min_qty and min_amt for validation
+            min_qty_str = min_info.get("min_qty")
+            min_amt_str = min_info.get("min_amt")
+            min_qty = float(min_qty_str) if min_qty_str else None
+            min_amt = float(min_amt_str) if min_amt_str else None
+
+            # Validate minimum quantity
+            if min_qty and quantity < min_qty:
+                error_msg = (
+                    f"Ордер слишком маленький для {symbol}\n"
+                    f"Количество: {quantity:.8f}\n"
+                    f"Минимум: {min_qty:.8f}"
+                )
+                self._log.warning(
+                    "Order rejected: qty={} < min_qty={} for {}",
+                    quantity, min_qty, symbol
+                )
+                await self._send_error_notification(error_msg)
+                return {
+                    "success": False,
+                    "error": f"Order quantity {quantity} below minimum {min_qty}",
+                    "error_code": "MIN_QTY_VIOLATION",
+                }
+
+            # Validate minimum order amount (qty * price >= min_amt)
+            # For market orders, get current price for estimation
+            if min_amt:
+                if price:
+                    order_value = quantity * price
+                else:
+                    # Get current price for market order validation
+                    current_price = await self._order_queue.get_price(symbol, self._category)
+                    order_value = quantity * current_price if current_price else 0
+
+                if order_value > 0 and order_value < min_amt:
+                    error_msg = (
+                        f"Сумма ордера слишком маленькая для {symbol}\n"
+                        f"Сумма: ${order_value:.2f}\n"
+                        f"Минимум: ${min_amt:.2f}"
+                    )
+                    self._log.warning(
+                        "Order rejected: order_value=${:.2f} < min_amt=${:.2f} for {}",
+                        order_value, min_amt, symbol
+                    )
+                    await self._send_error_notification(error_msg)
+                    return {
+                        "success": False,
+                        "error": f"Order value ${order_value:.2f} below minimum ${min_amt:.2f}",
+                        "error_code": "MIN_AMT_VIOLATION",
+                    }
 
             # IMPORTANT: Bybit has DIFFERENT limits for market vs limit orders!
             # - maxOrderQty: Maximum for LIMIT orders
@@ -421,8 +499,8 @@ class RealOrderExecutorService:
                     max_qty = stored_max_qty
 
             self._log.debug(
-                "Order limits for {}: qty_step={}, max_limit_qty={}, max_mkt_qty={}, stored={}, using={} ({})",
-                symbol, qty_step, max_limit_qty, max_mkt_qty, stored_max_qty, max_qty,
+                "Order limits for {}: min_qty={}, min_amt={}, qty_step={}, max_limit_qty={}, max_mkt_qty={}, stored={}, using={} ({})",
+                symbol, min_qty, min_amt, qty_step, max_limit_qty, max_mkt_qty, stored_max_qty, max_qty,
                 "MARKET" if is_market_order else "LIMIT"
             )
 
